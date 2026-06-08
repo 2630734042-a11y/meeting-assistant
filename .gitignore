@@ -1,0 +1,72 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+*.whl
+
+# Java
+target/
+*.class
+*.jar
+*.war
+*.ear
+.idea/
+*.iml
+.settings/
+.project
+.classpath
+out/
+
+# Go
+golang/vendor/
+*.exe
+*.exe~
+*.dll
+*.dylib
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-compose.override.yml
+
+# Models (large files)
+*.bin
+*.pt
+*.onnx
+/models/
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+.Spotlight-V100
+.Trashes
