@@ -51,7 +51,7 @@ from ..agents.summary_agent import SummaryAgent
 from ..agents.action_agent import ActionAgent
 from ..agents.insight_agent import InsightAgent
 from ..agents.followup_agent import FollowUpAgent
-from ..integrations.minimax_client import MiniMaxClient
+from ..integrations.llm_client import LLMClient
 from ..integrations.jira_client import JiraClient
 from ..integrations.feishu_client import FeishuClient
 from ..models.schemas import (
@@ -95,7 +95,7 @@ class GraphState(TypedDict, total=False):
 # ============================================================
 
 def build_meeting_graph(
-    llm_client: MiniMaxClient | None = None,
+    llm_client: LLMClient | None = None,
     jira_client: JiraClient | None = None,
     feishu_client: FeishuClient | None = None,
     transcription_config: TranscriptionConfig | None = None,
@@ -119,7 +119,7 @@ def build_meeting_graph(
         编译后的 StateGraph
     """
     # 共享依赖
-    llm = llm_client or MiniMaxClient()
+    llm = llm_client or LLMClient()
     jira = jira_client or JiraClient()
     feishu = feishu_client or FeishuClient()
 

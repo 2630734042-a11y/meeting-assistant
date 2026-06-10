@@ -15,7 +15,7 @@ from loguru import logger
 
 from ..integrations.feishu_client import FeishuClient
 from ..integrations.jira_client import JiraClient
-from ..integrations.minimax_client import MiniMaxClient
+from ..integrations.llm_client import LLMClient
 from ..models.schemas import ActionItem, ActionResult, Priority
 
 
@@ -73,11 +73,11 @@ class ActionAgent:
 
     def __init__(
         self,
-        llm_client: MiniMaxClient | None = None,
+        llm_client: LLMClient | None = None,
         jira_client: JiraClient | None = None,
         feishu_client: FeishuClient | None = None,
     ):
-        self.llm = llm_client or MiniMaxClient()
+        self.llm = llm_client or LLMClient()
         self.jira = jira_client or JiraClient()
         self.feishu = feishu_client or FeishuClient()
 

@@ -12,7 +12,7 @@ from typing import Any
 
 from loguru import logger
 
-from ..integrations.minimax_client import MiniMaxClient
+from ..integrations.llm_client import LLMClient
 from ..models.schemas import (
     MeetingStatus,
     MeetingSummary,
@@ -71,8 +71,8 @@ class SummaryAgent:
     - 长文本如何处理？（分块摘要 + 合并，MapReduce策略）
     """
 
-    def __init__(self, llm_client: MiniMaxClient | None = None):
-        self.llm = llm_client or MiniMaxClient()
+    def __init__(self, llm_client: LLMClient | None = None):
+        self.llm = llm_client or LLMClient()
 
     async def process(self, state: dict) -> dict:
         """

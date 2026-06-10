@@ -14,7 +14,7 @@ from typing import Any
 
 from loguru import logger
 
-from ..integrations.minimax_client import MiniMaxClient
+from ..integrations.llm_client import LLMClient
 from ..models.schemas import (
     MeetingInsight,
     SentimentType,
@@ -68,8 +68,8 @@ class InsightAgent:
     - 情绪分析的准确率如何保证？（LLM few-shot + 置信度阈值）
     """
 
-    def __init__(self, llm_client: MiniMaxClient | None = None):
-        self.llm = llm_client or MiniMaxClient()
+    def __init__(self, llm_client: LLMClient | None = None):
+        self.llm = llm_client or LLMClient()
 
     async def process(self, state: dict) -> dict:
         """
