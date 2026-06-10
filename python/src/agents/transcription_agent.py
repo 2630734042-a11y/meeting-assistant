@@ -122,23 +122,25 @@ class TranscriptionAgent:
         try:
             self._lazy_init()
             transcript = await self._transcribe(audio_data, meeting_id)
-            state["transcript"] = transcript
-            state["transcript_text"] = self._format_transcript_text(transcript)
+            return {
+                "status": MeetingStatus.TRANSCRIBING,
+                "transcript": transcript,
+                "transcript_text": self._format_transcript_text(transcript),
+            }
             logger.info(
                 f"[TranscriptionAgent] Transcription complete: "
                 f"{len(transcript.segments)} segments"
             )
         except Exception as e:
             logger.error(f"[TranscriptionAgent] Error: {e}")
-            state["errors"] = state.get("errors", []) + [
-                f"TranscriptionAgent: {str(e)}"
-            ]
-            state["transcript"] = self._generate_demo_transcript(meeting_id)
-            state["transcript_text"] = self._format_transcript_text(
-                state["transcript"]
-            )
-
-        return state
+            return {
+                "errors": [f"TranscriptionAgent: {str(e)}"],
+                "status": MeetingStatus.TRANSCRIBING,
+                "transcript": self._generate_demo_transcript(meeting_id),
+                "transcript_text": self._format_transcript_text(
+                    state["transcript"]
+                ),
+            }
 
     async def _transcribe(
         self, audio_data: bytes, meeting_id: str

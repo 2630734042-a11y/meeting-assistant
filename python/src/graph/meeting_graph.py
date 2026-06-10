@@ -41,6 +41,7 @@ LangGraph 会议处理图 —— 多Agent编排核心
 from __future__ import annotations
 
 import asyncio
+import operator
 from typing import Any, TypedDict, Annotated
 
 from langgraph.graph import StateGraph, START, END
@@ -55,7 +56,6 @@ from ..integrations.llm_client import LLMClient
 from ..integrations.jira_client import JiraClient
 from ..integrations.feishu_client import FeishuClient
 from ..models.schemas import (
-    MeetingState,
     MeetingStatus,
     create_initial_state,
 )
@@ -69,25 +69,21 @@ class GraphState(TypedDict, total=False):
     """
     LangGraph 使用 TypedDict 定义状态结构。
     每个 Node（Agent）都读写这个共享状态。
+
+    注意：所有并行 Fan-out 节点都返回完整 state，LangGraph 需要 reducer
+    来处理并发写入。用 lambda 取最后写入的值，errors 用 operator.add 累加。
     """
-    meeting_id: str
-    status: str
-    audio_data: bytes
 
-    # Transcription 输出
-    transcript: Any
-    transcript_text: str
-
-    # 并行 Agent 输出
-    summary: Any
-    actions: Any
-    insights: Any
-
-    # Follow-up 输出
-    followup: Any
-
-    # 错误记录
-    errors: list[str]
+    meeting_id: Annotated[str, lambda a, b: a or b]
+    status: Annotated[str, lambda a, b: b]
+    audio_data: Annotated[bytes, lambda a, b: a or b]
+    transcript: Annotated[Any, lambda a, b: a or b]
+    transcript_text: Annotated[str, lambda a, b: a or b]
+    summary: Annotated[Any, lambda a, b: a or b]
+    actions: Annotated[Any, lambda a, b: a or b]
+    insights: Annotated[Any, lambda a, b: a or b]
+    followup: Annotated[Any, lambda a, b: a or b]
+    errors: Annotated[list[str], operator.add]
 
 
 # ============================================================
