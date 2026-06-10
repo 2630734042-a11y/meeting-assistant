@@ -1,4 +1,13 @@
-"""MiniMax LLM 客户端 - 支持 M2.7 模型调用"""
+"""
+通用 LLM 客户端 - 支持 DeepSeek 及任意 OpenAI 兼容 API
+
+默认连接 DeepSeek API（OpenAI 兼容格式），通过环境变量切换服务商:
+  LLM_BASE_URL  → 默认 https://api.deepseek.com
+  LLM_API_KEY   → API Key
+  LLM_MODEL     → 默认 deepseek-chat
+
+兼容 OpenAI / DeepSeek / 通义千问 / 智谱 等所有 OpenAI 格式 API。
+"""
 
 from __future__ import annotations
 
@@ -11,29 +20,31 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 
-class MiniMaxClient:
+class LLMClient:
     """
-    MiniMax API 客户端
+    通用 OpenAI 兼容 LLM 客户端
 
-    支持 MiniMax M2.7 模型，兼容 OpenAI 接口格式。
-    文档: https://platform.minimaxi.com/document/guides/chat-model/chat/api
+    API 格式: POST /v1/chat/completions
+    文档: https://api-docs.deepseek.com/
     """
-
-    BASE_URL = "https://api.minimax.chat/v1"
 
     def __init__(
         self,
+        base_url: str | None = None,
         api_key: str | None = None,
-        group_id: str | None = None,
-        model: str = "abab6.5s-chat",
+        model: str = "deepseek-chat",
     ):
-        self.api_key = api_key or os.getenv("MINIMAX_API_KEY", "")
-        self.group_id = group_id or os.getenv("MINIMAX_GROUP_ID", "")
-        self.model = model
-        self._client = httpx.AsyncClient(
-            timeout=60.0,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-        )
+        self.base_url = base_url or os.getenv(
+            "LLM_BASE_URL", "https://api.deepseek.com"
+        ).rstrip("/")
+        self.api_key = api_key or os.getenv("LLM_API_KEY", "")
+        self.model = model or os.getenv("LLM_MODEL", "deepseek-chat")
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        self._client = httpx.AsyncClient(timeout=120.0, headers=headers)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     async def chat(
@@ -44,12 +55,12 @@ class MiniMaxClient:
         response_format: dict | None = None,
     ) -> str:
         """
-        调用 MiniMax 聊天接口
+        调用 LLM 聊天接口
 
         Args:
             messages: 消息列表 [{"role": "user", "content": "..."}]
             temperature: 温度参数
-            max_tokens: 最大生成token数
+            max_tokens: 最大生成 token 数
             response_format: 输出格式约束 (如 {"type": "json_object"})
 
         Returns:
@@ -64,18 +75,16 @@ class MiniMaxClient:
         if response_format:
             payload["response_format"] = response_format
 
-        url = f"{self.BASE_URL}/text/chatcompletion_v2"
-        if self.group_id:
-            url = f"{url}?GroupId={self.group_id}"
-
+        url = f"{self.base_url}/v1/chat/completions"
         response = await self._client.post(url, json=payload)
         response.raise_for_status()
-
         data = response.json()
-        if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
 
-        logger.error(f"MiniMax API unexpected response: {data}")
+        if "choices" in data and len(data["choices"]) > 0:
+            content = data["choices"][0]["message"]["content"]
+            return content
+
+        logger.error(f"LLM API unexpected response: {data}")
         raise ValueError(f"Unexpected API response: {data}")
 
     async def chat_json(
@@ -94,6 +103,7 @@ class MiniMaxClient:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
+            # JSON 解析失败的降级：尝试截取 {...} 片段
             start = text.find("{")
             end = text.rfind("}") + 1
             if start >= 0 and end > start:
