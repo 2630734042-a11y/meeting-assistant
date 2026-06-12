@@ -61,6 +61,15 @@ class SentimentType(str, Enum):
     NEGATIVE = "negative"
 
 
+class ReviewStatus(str, Enum):
+    """待办审核状态 —— Human-in-the-Loop"""
+
+    PENDING = "pending"       # 待审核
+    CONFIRMED = "confirmed"   # 已确认，允许同步
+    DELETED = "deleted"       # 已删除，不同步
+    MODIFIED = "modified"     # 已修改，允许同步（用修改后的值）
+
+
 # ============================================================
 # 转写 (Transcription) 模型
 # ============================================================
@@ -138,6 +147,9 @@ class ActionItem(BaseModel):
     deadline: str = Field(default="", description="截止日期 YYYY-MM-DD")
     priority: Priority = Field(default=Priority.MEDIUM, description="优先级")
     context: str = Field(default="", description="任务背景/上下文")
+
+    # 审核状态 — HITL
+    review_status: str = Field(default="pending", description="审核状态: pending/confirmed/deleted/modified")
 
     # 同步状态 — 由 _sync_to_external 填充
     jira_issue_key: str = Field(default="", description="关联的 Jira Issue Key")
