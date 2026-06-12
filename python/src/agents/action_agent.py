@@ -227,7 +227,7 @@ async def sync_actions_node(state: dict) -> dict:
     LangGraph 节点 —— 同步已审核通过的待办到 Jira 和飞书。
 
     仅同步 review_status 为 "confirmed" 或 "modified" 的条目，
-    "deleted" 和 "pending" 的条目跳过。
+    未审核通过的条目跳过。
     已有 jira_issue_key 或 feishu_task_id 的条目幂等跳过。
     """
     from ..integrations.jira_client import JiraClient
@@ -247,7 +247,7 @@ async def sync_actions_node(state: dict) -> dict:
 
     for item in actions_result.action_items:
         # 跳过不需要同步的条目
-        if item.review_status in ("deleted", "pending"):
+        if item.review_status not in ("confirmed", "modified"):
             continue
         if item.jira_issue_key and item.feishu_task_id:
             # 已同步，幂等跳过
