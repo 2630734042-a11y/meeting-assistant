@@ -83,9 +83,10 @@ class ActionAgent:
 
     async def process(self, state: dict) -> dict:
         """
-        LangGraph 节点函数 —— 提取待办并同步
+        LangGraph 节点函数 —— 仅提取待办，不同步到外部系统。
 
-        与 Summary Agent、Insight Agent 并行执行。
+        同步操作移到了独立的 sync_actions_node 函数，
+        在 Human-in-the-Loop 审核之后执行。
         """
         meeting_id = state.get("meeting_id", "unknown")
         logger.info(f"[ActionAgent] Processing meeting: {meeting_id}")
@@ -100,18 +101,21 @@ class ActionAgent:
 
         try:
             action_items = await self._extract_actions(transcript_text)
-            synced_items = await self._sync_to_external(action_items, meeting_id)
+            # 所有条目初始状态为 pending，留待人工审核
+            for item in action_items:
+                item.review_status = "pending"
 
             state["actions"] = ActionResult(
                 meeting_id=meeting_id,
-                action_items=synced_items,
+                action_items=action_items,
                 sync_status={
                     "jira": "enabled" if self.jira.is_enabled else "disabled",
                     "feishu": "enabled" if self.feishu.is_enabled else "disabled",
                 },
             )
             logger.info(
-                f"[ActionAgent] Extracted {len(synced_items)} action items"
+                f"[ActionAgent] Extracted {len(action_items)} action items "
+                f"(pending review)"
             )
         except Exception as e:
             logger.error(f"[ActionAgent] Error: {e}")
@@ -216,3 +220,92 @@ class ActionAgent:
             synced.append(item)
 
         return synced
+
+
+async def sync_actions_node(state: dict) -> dict:
+    """
+    LangGraph 节点 —— 同步已审核通过的待办到 Jira 和飞书。
+
+    仅同步 review_status 为 "confirmed" 或 "modified" 的条目，
+    "deleted" 和 "pending" 的条目跳过。
+    已有 jira_issue_key 或 feishu_task_id 的条目幂等跳过。
+    """
+    from ..integrations.jira_client import JiraClient
+    from ..integrations.feishu_client import FeishuClient
+
+    meeting_id = state.get("meeting_id", "unknown")
+    logger.info(f"[sync_actions] Syncing for meeting: {meeting_id}")
+
+    actions_result = state.get("actions")
+    if not actions_result or not actions_result.action_items:
+        logger.info("[sync_actions] No action items to sync")
+        return state
+
+    jira = JiraClient()
+    feishu = FeishuClient()
+    sync_errors = []
+
+    for item in actions_result.action_items:
+        # 跳过不需要同步的条目
+        if item.review_status in ("deleted", "pending"):
+            continue
+        if item.jira_issue_key and item.feishu_task_id:
+            # 已同步，幂等跳过
+            continue
+
+        # Jira 同步
+        if jira.is_enabled:
+            try:
+                jira_result = jira.create_issue(
+                    summary=f"[会议待办] {item.task}",
+                    description=(
+                        f"来源：会议 {meeting_id}\n"
+                        f"负责人：{item.assignee}\n"
+                        f"上下文：{item.context}"
+                    ),
+                    assignee=jira.resolve_user(item.assignee),
+                    due_date=item.deadline or None,
+                    priority=JiraClient.map_priority(item.priority.value),
+                    labels=["meeting-auto", f"meeting-{meeting_id}"],
+                )
+                item.jira_issue_key = jira_result["key"]
+                logger.info(f"Jira issue created: {jira_result['key']}")
+            except Exception as e:
+                msg = f"Jira sync failed for '{item.task}': {e}"
+                logger.error(msg)
+                sync_errors.append(msg)
+
+        # 飞书同步
+        if feishu.is_enabled:
+            try:
+                from datetime import datetime
+                due_ts = None
+                if item.deadline:
+                    due_dt = datetime.strptime(item.deadline, "%Y-%m-%d")
+                    due_ts = int(due_dt.timestamp())
+
+                feishu_result = await feishu.create_task(
+                    summary=f"[会议待办] {item.task}",
+                    description=(
+                        f"负责人：{item.assignee}\n"
+                        f"来源会议：{meeting_id}\n"
+                        f"上下文：{item.context}"
+                    ),
+                    due_timestamp=due_ts,
+                )
+                item.feishu_task_id = feishu_result.get("task_id")
+                logger.info(f"Feishu task created: {item.feishu_task_id}")
+            except Exception as e:
+                msg = f"Feishu sync failed for '{item.task}': {e}"
+                logger.error(msg)
+                sync_errors.append(msg)
+
+    if sync_errors:
+        state["errors"] = state.get("errors", []) + sync_errors
+
+    logger.info(
+        f"[sync_actions] Done: "
+        f"synced={sum(1 for i in actions_result.action_items if i.jira_issue_key or i.feishu_task_id)}, "
+        f"errors={len(sync_errors)}"
+    )
+    return state
