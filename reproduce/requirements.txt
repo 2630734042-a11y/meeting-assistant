@@ -1,0 +1,42 @@
+# Multi-Agent Meeting Assistant - Python 依赖
+# 安装: pip install -r requirements.txt
+#
+# 你需要写入以下依赖（按功能分组）:
+
+# === Agent 编排框架 ===
+# langgraph>=0.2.0      - LangGraph 状态图编排
+# langchain>=0.3.0      - LangChain 基础库
+
+# === LLM 调用 ===
+# openai>=1.50.0        - OpenAI SDK (MiniMax 兼容 OpenAI 接口)
+# httpx>=0.27.0         - 异步 HTTP 客户端
+
+# === 语音转写 (可选，不安装时使用 demo 数据降级) ===
+# whisperx>=3.1.0       - WhisperX 语音转写 (比原版 Whisper 快 70x)
+# faster-whisper>=1.0.0 - CTranslate2 加速的 Whisper
+# pyannote.audio>=3.3.0 - 说话人识别 (Speaker Diarization)
+# torch>=2.1.0          - PyTorch 深度学习框架
+# torchaudio>=2.1.0     - PyTorch 音频处理
+
+# === Web 框架 ===
+# fastapi>=0.115.0      - FastAPI Web 框架
+# uvicorn[standard]>=0.32.0 - ASGI 服务器
+# websockets>=13.0      - WebSocket 支持
+# python-multipart>=0.0.12 - 文件上传支持
+
+# === 外部集成 ===
+# jira>=3.8.0           - Jira Python SDK
+# requests>=2.32.0      - HTTP 请求库
+
+# === 数据处理 ===
+# pydantic>=2.9.0       - 数据模型与验证
+# numpy>=1.26.0         - 数值计算
+
+# === 工具库 ===
+# python-dotenv>=1.0.0  - .env 文件加载
+# loguru>=0.7.0         - 结构化日志
+# tenacity>=9.0.0       - 重试策略 (指数退避)
+
+# === 测试 ===
+# pytest>=8.3.0         - 测试框架
+# pytest-asyncio>=0.24.0 - 异步测试支持

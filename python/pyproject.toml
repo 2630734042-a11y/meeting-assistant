@@ -24,6 +24,38 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+dependencies = [
+    # === Agent Framework ===
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
+    # === LLM Providers ===
+    "openai>=1.50.0",
+    "httpx>=0.27.0",
+    # === Web Framework ===
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "websockets>=13.0",
+    "python-multipart>=0.0.12",
+    # === External Integrations ===
+    "jira>=3.8.0",
+    "requests>=2.32.0",
+    # === Database ===
+    "sqlalchemy>=2.0.0",
+    "chromadb>=0.5.0",
+    # === Data Processing ===
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "numpy>=1.26.0",
+    # === Utilities ===
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "tenacity>=9.0.0",
+    "apscheduler>=3.10.0",
+    # === Static Files ===
+    "aiofiles>=24.0",
+]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3",

@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from typing import Any
 
 import httpx
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+
+def _is_feishu_placeholder(value: str) -> bool:
+    """检测是否为飞书占位配置值"""
+    if not value:
+        return True
+    placeholder_markers = [
+        "your_feishu", "your_webhook", "your-",
+        "open.feishu.cn/open-apis/bot/v2/hook/your",
+    ]
+    lower = value.lower()
+    return any(m in lower for m in placeholder_markers)
 
 
 class FeishuClient:
@@ -19,6 +32,10 @@ class FeishuClient:
     - 发送群消息（推送会议纪要）
     - 创建任务（同步待办事项）
     - Webhook 机器人消息
+
+    两种模式:
+    - 生产模式: 配置真实飞书凭据 → 调用飞书 Open API
+    - Demo 模式: 占位凭据或无凭据 → 模拟推送和任务创建
 
     API 文档: https://open.feishu.cn/document/home/index
     """
@@ -40,10 +57,33 @@ class FeishuClient:
         self._enabled = bool(
             (self.app_id and self.app_secret) or self.webhook_url
         )
+        self._demo_mode = False
+        self._demo_task_counter = 0
+
+        # 检测 demo 模式：凭据存在但是占位值
+        if self._enabled:
+            is_placeholder = (
+                _is_feishu_placeholder(self.webhook_url)
+                and _is_feishu_placeholder(self.app_id)
+                and _is_feishu_placeholder(self.app_secret)
+            )
+            if is_placeholder:
+                self._demo_mode = True
+                logger.info(
+                    "FeishuClient running in DEMO mode (placeholder credentials detected)"
+                )
+            else:
+                logger.info("FeishuClient configured for production")
+        else:
+            logger.info("FeishuClient not configured — disabled")
 
     @property
     def is_enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def is_demo_mode(self) -> bool:
+        return self._demo_mode
 
     async def _get_tenant_token(self) -> str:
         """获取 tenant_access_token（自动缓存和刷新）"""
@@ -80,6 +120,14 @@ class FeishuClient:
         Returns:
             是否发送成功
         """
+        if not self._enabled:
+            logger.warning("Feishu webhook not configured, skipping")
+            return False
+
+        if self._demo_mode:
+            logger.info(f"[DEMO] Feishu webhook message sent: {title}")
+            return True
+
         if not self.webhook_url:
             logger.warning("Feishu webhook not configured, skipping")
             return False
@@ -126,6 +174,11 @@ class FeishuClient:
             receive_id_type: ID类型 chat_id/open_id/user_id/email
             msg_type: 消息类型 text/interactive/post
         """
+        if self._demo_mode:
+            msg_id = f"om_{uuid.uuid4().hex[:16]}"
+            logger.info(f"[DEMO] Feishu message sent to {receive_id}: {content[:50]}...")
+            return {"code": 0, "data": {"message_id": msg_id}}
+
         token = await self._get_tenant_token()
         if not token:
             return {"success": False, "error": "No token"}
@@ -159,6 +212,12 @@ class FeishuClient:
             due_timestamp: 截止时间戳（秒）
             assignee_ids: 负责人open_id列表
         """
+        if self._demo_mode:
+            self._demo_task_counter += 1
+            task_id = f"demo_task_{self._demo_task_counter:04d}"
+            logger.info(f"[DEMO] Created Feishu task: {task_id} - {summary}")
+            return {"task_id": task_id, "data": {"task": {"id": task_id, "summary": summary}}}
+
         token = await self._get_tenant_token()
         if not token:
             return {"success": False, "error": "No token"}

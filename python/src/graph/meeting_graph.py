@@ -19,6 +19,12 @@ LangGraph 会议处理图 —— 多Agent编排核心
   Summary Action Insight
   Agent   Agent  Agent
     │      │       │
+    │      ▼       │
+    │  ┌────────┐  │
+    │  │  sync  │  │  ← HITL 审核点 (interrupt_before)
+    │  │actions │  │
+    │  └───┬────┘  │
+    │      │       │
     └──────┼───────┘  ← Fan-in (汇聚)
            │
            ▼
@@ -44,12 +50,13 @@ import asyncio
 import operator
 from typing import Any, TypedDict, Annotated
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 from loguru import logger
 
 from ..agents.transcription_agent import TranscriptionAgent, TranscriptionConfig
 from ..agents.summary_agent import SummaryAgent
-from ..agents.action_agent import ActionAgent
+from ..agents.action_agent import ActionAgent, sync_actions_node
 from ..agents.insight_agent import InsightAgent
 from ..agents.followup_agent import FollowUpAgent
 from ..integrations.llm_client import LLMClient
@@ -59,6 +66,21 @@ from ..models.schemas import (
     MeetingStatus,
     create_initial_state,
 )
+
+
+# ============================================================
+# 模块级 MemorySaver —— 跨 run/resume 调用共享 checkpoint
+# ============================================================
+
+_memory_saver: MemorySaver | None = None
+
+
+def _get_checkpointer() -> MemorySaver:
+    """返回全局唯一的 MemorySaver 实例，确保 checkpoint 跨调用共享。"""
+    global _memory_saver
+    if _memory_saver is None:
+        _memory_saver = MemorySaver()
+    return _memory_saver
 
 
 # ============================================================
@@ -83,6 +105,7 @@ class GraphState(TypedDict, total=False):
     actions: Annotated[Any, lambda a, b: a or b]
     insights: Annotated[Any, lambda a, b: a or b]
     followup: Annotated[Any, lambda a, b: a or b]
+    thread_id: Annotated[str, lambda a, b: a or b]
     errors: Annotated[list[str], operator.add]
 
 
@@ -136,6 +159,9 @@ def build_meeting_graph(
     graph.add_node("insight", insight_agent.process)
     graph.add_node("followup", followup_agent.process)
 
+    # 注册 sync_actions 节点（HITL 审核后执行同步）
+    graph.add_node("sync_actions", sync_actions_node)
+
     # ---- 定义边（Edge = 流转关系）----
 
     # Pipeline 阶段: START → Transcription
@@ -148,7 +174,9 @@ def build_meeting_graph(
 
     # Fan-in 汇聚: [Summary, Action, Insight] → Follow-up
     graph.add_edge("summary", "followup")
-    graph.add_edge("action", "followup")
+    # Action 先经过 sync_actions（HITL 审核点），再进入 Follow-up
+    graph.add_edge("action", "sync_actions")
+    graph.add_edge("sync_actions", "followup")
     graph.add_edge("insight", "followup")
 
     # 结束: Follow-up → END
@@ -159,45 +187,85 @@ def build_meeting_graph(
 
 
 def compile_meeting_graph(**kwargs) -> Any:
-    """构建并编译 Graph（编译后可直接调用）"""
+    """构建并编译 Graph —— 用 interrupt_before 在 sync_actions 前暂停"""
     graph = build_meeting_graph(**kwargs)
-    compiled = graph.compile()
-    logger.info("Meeting graph compiled successfully")
+    checkpointer = _get_checkpointer()
+    compiled = graph.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["sync_actions"],
+    )
+    logger.info("Meeting graph compiled (HITL: interrupt_before sync_actions)")
     return compiled
 
 
 async def run_meeting_pipeline(
     meeting_id: str,
     audio_data: bytes = b"",
+    thread_id: str = "",
     **kwargs,
 ) -> dict:
+    """执行完整的会议处理 Pipeline，sync_actions 前中断等待人工审核"""
+    logger.info(f"Starting meeting pipeline: {meeting_id} (thread={thread_id or 'new'})")
+
+    thread_id = thread_id or f"thread-{meeting_id}"
+
+    try:
+        initial_state = create_initial_state(meeting_id, audio_data)
+        initial_state["thread_id"] = thread_id
+
+        compiled_graph = compile_meeting_graph(**kwargs)
+        config = {"configurable": {"thread_id": thread_id}}
+
+        final_state = await compiled_graph.ainvoke(initial_state, config=config)
+
+        errors = final_state.get("errors", [])
+        if errors:
+            logger.warning(f"Pipeline completed with errors: {errors}")
+        else:
+            logger.info(f"Pipeline completed: {meeting_id}")
+
+        final_state["thread_id"] = thread_id
+        return final_state
+
+    except Exception as e:
+        logger.error(f"Pipeline failed: {meeting_id} - {e}")
+        return {
+            "meeting_id": meeting_id,
+            "thread_id": thread_id,
+            "status": "failed",
+            "errors": [f"Pipeline execution failed: {str(e)}"],
+        }
+
+
+async def resume_meeting_pipeline(thread_id: str, **kwargs) -> dict:
     """
-    执行完整的会议处理 Pipeline
+    从中断点恢复 Pipeline 执行。
 
-    这是对外暴露的主入口函数：
-    1. 创建初始状态
-    2. 编译 Graph
-    3. 执行 Graph
-    4. 返回最终状态
-
-    Args:
-        meeting_id: 会议ID
-        audio_data: 音频数据（为空则使用演示数据）
-
-    Returns:
-        最终的 MeetingState 字典
+    前提：用户已通过 PUT /actions/review 提交审核结果。
+    LangGraph 通过 configurable thread_id 在 checkpoint 找到中断状态，
+    传入 None 表示从上次中断点继续执行。
     """
-    logger.info(f"Starting meeting pipeline: {meeting_id}")
+    logger.info(f"Resuming pipeline: thread={thread_id}")
 
-    initial_state = create_initial_state(meeting_id, audio_data)
-    compiled_graph = compile_meeting_graph(**kwargs)
+    try:
+        compiled_graph = compile_meeting_graph(**kwargs)
+        config = {"configurable": {"thread_id": thread_id}}
 
-    final_state = await compiled_graph.ainvoke(initial_state)
+        # 传入 None 而非初始 state → LangGraph 从中断的 checkpoint 继续
+        final_state = await compiled_graph.ainvoke(None, config=config)
 
-    errors = final_state.get("errors", [])
-    if errors:
-        logger.warning(f"Pipeline completed with errors: {errors}")
-    else:
-        logger.info(f"Pipeline completed successfully for: {meeting_id}")
+        errors = final_state.get("errors", [])
+        if errors:
+            logger.warning(f"Resumed pipeline completed with errors: {errors}")
+        else:
+            logger.info(f"Resumed pipeline completed: {thread_id}")
 
-    return final_state
+        return final_state
+
+    except Exception as e:
+        logger.error(f"Resume pipeline failed: thread={thread_id} - {e}")
+        return {
+            "thread_id": thread_id,
+            "status": "failed",
+            "errors": [f"Resume execution failed: {str(e)}"],
+        }

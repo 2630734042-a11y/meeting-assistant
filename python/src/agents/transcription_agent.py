@@ -70,6 +70,9 @@ class TranscriptionAgent:
         """
         懒加载模型 —— 避免在导入时就加载大模型。
         生产中模型应在服务启动时预热。
+
+        如果模型加载失败（网络/SSL/未安装等），会保持 _model=None，
+        后续 _transcribe() 检查到 _model 为 None 时自动降级为 demo 模式。
         """
         if self._initialized:
             return
@@ -90,8 +93,15 @@ class TranscriptionAgent:
             logger.info("WhisperX model loaded successfully")
         except ImportError:
             logger.warning(
-                "WhisperX not installed, using mock transcription. "
+                "WhisperX not installed, "
+                "falling back to demo transcription. "
                 "Install with: pip install whisperx"
+            )
+            self._initialized = True
+        except Exception as e:
+            logger.warning(
+                f"WhisperX model load failed ({type(e).__name__}: {e}), "
+                f"falling back to demo transcription"
             )
             self._initialized = True
 
@@ -122,24 +132,23 @@ class TranscriptionAgent:
         try:
             self._lazy_init()
             transcript = await self._transcribe(audio_data, meeting_id)
+            logger.info(
+                f"[TranscriptionAgent] Transcription complete: "
+                f"{len(transcript.segments)} segments"
+            )
             return {
                 "status": MeetingStatus.TRANSCRIBING,
                 "transcript": transcript,
                 "transcript_text": self._format_transcript_text(transcript),
             }
-            logger.info(
-                f"[TranscriptionAgent] Transcription complete: "
-                f"{len(transcript.segments)} segments"
-            )
         except Exception as e:
             logger.error(f"[TranscriptionAgent] Error: {e}")
+            demo_transcript = self._generate_demo_transcript(meeting_id)
             return {
                 "errors": [f"TranscriptionAgent: {str(e)}"],
                 "status": MeetingStatus.TRANSCRIBING,
-                "transcript": self._generate_demo_transcript(meeting_id),
-                "transcript_text": self._format_transcript_text(
-                    state["transcript"]
-                ),
+                "transcript": demo_transcript,
+                "transcript_text": self._format_transcript_text(demo_transcript),
             }
 
     async def _transcribe(
@@ -163,6 +172,8 @@ class TranscriptionAgent:
             )
 
             # Step 2: 时间戳对齐
+            # WhisperX 自带的时间戳是估计的（±500ms 误差），
+            # wav2vec2 做音素级对齐，把每个词的起止时间压到 ±50ms。这样后面的说话人识别才能准确归属。
             if self._align_model is None:
                 model_a, metadata = whisperx.load_align_model(
                     language_code=self.config.language,
@@ -178,7 +189,9 @@ class TranscriptionAgent:
                 self.config.device,
             )
 
-            # Step 3: 说话人识别
+            # Step 3: 说话人识别pyannote 对音频做 speaker embedding + 聚类，
+            # 区分出不同说话人。然后 assign_word_speakers 把每个词归属到具体的人。
+            # 没配 token 时跳过这一步，所有人标记为 "Unknown"
             if self._diarize_pipeline is None and self.config.hf_token:
                 self._diarize_pipeline = whisperx.DiarizationPipeline(
                     use_auth_token=self.config.hf_token,

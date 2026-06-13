@@ -9,6 +9,18 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 
+def _is_placeholder(value: str) -> bool:
+    """检测是否为占位配置值"""
+    if not value:
+        return True
+    placeholder_markers = [
+        "your-company", "your_email", "your_jira", "your-",
+        "atlassian.net",  # 仅域名不足以构成真实凭据
+    ]
+    lower = value.lower()
+    return any(m in lower for m in placeholder_markers)
+
+
 class JiraClient:
     """
     Jira Cloud REST API 客户端
@@ -17,6 +29,10 @@ class JiraClient:
     - 创建 Issue（从会议待办自动同步）
     - 查询 Issue 状态（用于跟踪待办完成情况）
     - 更新 Issue（添加评论等）
+
+    两种模式:
+    - 生产模式: 配置真实 Jira 凭据 → 调用 Atlassian REST API
+    - Demo 模式: 占位凭据或无凭据 → 模拟创建 Issue（返回 MEET-42 等虚拟 Key）
 
     API 文档: https://developer.atlassian.com/cloud/jira/platform/rest/v3/
     """
@@ -34,10 +50,27 @@ class JiraClient:
         self.project_key = project_key or os.getenv("JIRA_PROJECT_KEY", "MEET")
         self._jira = None
         self._enabled = bool(self.server and self.email and self.api_token)
+        self._demo_mode = False
+        self._demo_counter = 0
+
+        # 检测 demo 模式：凭据存在但是占位值
+        if self._enabled and (
+            _is_placeholder(self.server)
+            or _is_placeholder(self.email)
+            or _is_placeholder(self.api_token)
+        ):
+            self._demo_mode = True
+            logger.info(
+                "JiraClient running in DEMO mode (placeholder credentials detected)"
+            )
+        elif not self._enabled:
+            logger.info("JiraClient not configured — disabled")
+        else:
+            logger.info(f"JiraClient configured for {self.server}")
 
     def _get_client(self):
-        """懒加载 Jira 客户端"""
-        if self._jira is None and self._enabled:
+        """懒加载 Jira 客户端（仅生产模式）"""
+        if self._jira is None and self._enabled and not self._demo_mode:
             from jira import JIRA
             self._jira = JIRA(
                 server=self.server,
@@ -47,9 +80,14 @@ class JiraClient:
 
     @property
     def is_enabled(self) -> bool:
+        """Jira 集成是否可用（生产模式或 demo 模式）"""
         return self._enabled
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    @property
+    def is_demo_mode(self) -> bool:
+        """是否运行在 demo 模式"""
+        return self._demo_mode
+
     def create_issue(
         self,
         summary: str,
@@ -79,6 +117,51 @@ class JiraClient:
             logger.warning("Jira integration not configured, skipping")
             return {"key": "DISABLED", "id": "", "url": ""}
 
+        if self._demo_mode:
+            return self._create_demo_issue(
+                summary, description, assignee, due_date, priority, labels
+            )
+
+        return self._create_real_issue(
+            summary, description, assignee, due_date, priority, issue_type, labels
+        )
+
+    def _create_demo_issue(
+        self,
+        summary: str,
+        description: str = "",
+        assignee: str | None = None,
+        due_date: str | None = None,
+        priority: str = "Medium",
+        labels: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Demo 模式：模拟创建 Issue，返回虚拟 Key"""
+        self._demo_counter += 1
+        issue_num = 40 + self._demo_counter
+        key = f"{self.project_key}-{issue_num}"
+        result = {
+            "key": key,
+            "id": str(10000 + issue_num),
+            "url": f"{self.server}/browse/{key}",
+        }
+        logger.info(
+            f"[DEMO] Created mock Jira issue: {key} "
+            f"(assignee={assignee}, due={due_date}, priority={priority})"
+        )
+        return result
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    def _create_real_issue(
+        self,
+        summary: str,
+        description: str = "",
+        assignee: str | None = None,
+        due_date: str | None = None,
+        priority: str = "Medium",
+        issue_type: str = "Task",
+        labels: list[str] | None = None,
+    ) -> dict[str, str]:
+        """生产模式：调用 Atlassian REST API 创建 Issue"""
         client = self._get_client()
 
         fields: dict[str, Any] = {
@@ -111,6 +194,8 @@ class JiraClient:
         """查询 Issue 当前状态"""
         if not self._enabled:
             return "DISABLED"
+        if self._demo_mode:
+            return "To Do"
         client = self._get_client()
         issue = client.issue(issue_key)
         return str(issue.fields.status)
@@ -118,6 +203,9 @@ class JiraClient:
     def add_comment(self, issue_key: str, comment: str) -> None:
         """为 Issue 添加评论"""
         if not self._enabled:
+            return
+        if self._demo_mode:
+            logger.info(f"[DEMO] Added comment to {issue_key}: {comment[:50]}...")
             return
         client = self._get_client()
         client.add_comment(issue_key, comment)

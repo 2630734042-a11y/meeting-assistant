@@ -1,9 +1,6 @@
-# Environment & Secrets
-.env
-.env.local
-.env.*.local
-*.key
-*.pem
+# Dependencies
+node_modules/
+
 
 # Python
 __pycache__/
