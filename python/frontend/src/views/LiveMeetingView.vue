@@ -7,6 +7,12 @@
           <n-tag :type="isRecording ? 'error' : 'default'" round>
             {{ isRecording ? '🔴 会议进行中' : '⏸ 已停止' }}
           </n-tag>
+          <n-tag v-if="isRecording && audioSources === 'mic_and_system'" type="info" size="small" round>
+            🎙+🔊 双路
+          </n-tag>
+          <n-tag v-else-if="isRecording" size="small" round>
+            🎙 仅麦克风
+          </n-tag>
           <n-text depth="2">
             {{ formatTime(elapsedSeconds) }}
           </n-text>
@@ -122,6 +128,7 @@ const {
   elapsedSeconds,
   error,
   isRecording,
+  audioSources,
   start,
   stop,
 } = useLiveSession(meetingId)
