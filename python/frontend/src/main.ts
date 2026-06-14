@@ -9,6 +9,7 @@ const routes = [
   { path: '/upload', component: () => import('./views/UploadView.vue') },
   { path: '/report/:id', component: () => import('./views/ReportView.vue') },
   { path: '/history', component: () => import('./views/HistoryView.vue') },
+  { path: '/live/:meetingId', component: () => import('./views/LiveMeetingView.vue') },
 ]
 
 const router = createRouter({ history: createWebHashHistory(), routes })

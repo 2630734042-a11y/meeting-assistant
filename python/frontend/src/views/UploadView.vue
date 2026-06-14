@@ -16,6 +16,9 @@
         </n-upload-dragger>
       </n-upload>
       <n-space justify="center" style="margin-top: 12px">
+        <n-button @click="router.push('/live/' + generateLiveId())" type="primary">
+          🎙 实时会议
+        </n-button>
         <n-button @click="runDemoMode" :loading="uploading" type="tertiary">
           或运行演示模式（无需文件）
         </n-button>
@@ -98,6 +101,10 @@ async function handleUpload({ file }: UploadCustomRequestOptions) {
   uploading.value = false
   processing.value = false
   router.push(`/report/${meetingId}`)
+}
+
+function generateLiveId(): string {
+  return `live-${Date.now()}`
 }
 
 async function runDemoMode() {
