@@ -24,6 +24,7 @@ load_dotenv()
 
 from ..graph.meeting_graph import run_meeting_pipeline, resume_meeting_pipeline, compile_meeting_graph
 from ..models.schemas import MeetingStatus, Priority
+from ..realtime.session_manager import LiveSessionManager
 
 from ..utils.media_utils import (
     SUPPORTED_VIDEO_EXTENSIONS,
@@ -140,6 +141,52 @@ async def websocket_meeting(websocket: WebSocket, meeting_id: str):
             pass
     finally:
         active_connections.pop(meeting_id, None)
+
+
+# ============================================================
+# 实时会议 WebSocket 端点 (NEW)
+# ============================================================
+
+@app.websocket("/ws/live/{meeting_id}")
+async def websocket_live_meeting(websocket: WebSocket, meeting_id: str):
+    """
+    实时会议 WebSocket 端点 — Level 2 Streaming
+
+    协议:
+    - 客户端发送:
+        - 二进制 PCM 16kHz 16bit mono 音频帧
+        - {"type": "start", "meeting_id": "...", "title": "..."}
+        - {"type": "stop"}
+        - {"type": "ping"}
+
+    - 服务端返回:
+        - {"type": "connected", "meeting_id": "...", "session_id": "..."}
+        - {"type": "transcript_delta", "data": TranscriptSegment}
+        - {"type": "summary_update", "data": MeetingSummary}
+        - {"type": "actions_update", "data": ActionResult}
+        - {"type": "insights_update", "data": MeetingInsight}
+        - {"type": "completed", "meeting_id": "...", ...}
+        - {"type": "error", "message": "..."}
+        - {"type": "pong"}
+    """
+    await websocket.accept()
+
+    session = LiveSessionManager(
+        meeting_id=meeting_id,
+        websocket=websocket,
+    )
+
+    try:
+        await session.run()
+    except Exception as e:
+        logger.error(f"Live session error: {meeting_id} - {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e),
+            })
+        except Exception:
+            pass
 
 
 async def _send_results(websocket: WebSocket, state: dict):
