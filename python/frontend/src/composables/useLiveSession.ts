@@ -15,6 +15,7 @@ export interface LiveSessionState {
   elapsedSeconds: Ref<number>
   error: Ref<string | null>
   isRecording: Ref<boolean>
+  audioSources: Ref<'mic_only' | 'mic_and_system'>
 }
 
 export function useLiveSession(meetingId: string): LiveSessionState & {
@@ -219,6 +220,7 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
     summary.value = null
     actions.value = null
     insights.value = null
+    audioSources.value = 'mic_only'
 
     ws = connect()
 
@@ -235,7 +237,9 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
       }
     })
 
-    await startMic()
+    micStream = await captureMic()             // 必须成功，否则抛错
+    sysStream = await startSystemAudio()       // 可选，失败返回 null → 降级
+    setupAudioPipeline(micStream, sysStream)
     isRecording.value = true
     startTimer()
   }
@@ -248,17 +252,29 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
       ws.send(JSON.stringify({ type: 'stop' }))
     }
 
+    // 断开音频节点
     if (processor) {
       processor.disconnect()
       processor = null
     }
+    if (micGain) { micGain.disconnect(); micGain = null }
+    if (sysGain) { sysGain.disconnect(); sysGain = null }
+    if (micSource) { micSource.disconnect(); micSource = null }
+    if (sysSource) { sysSource.disconnect(); sysSource = null }
     if (audioContext) {
       audioContext.close()
       audioContext = null
     }
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop())
-      stream = null
+
+    // 停止麦克风媒体流
+    if (micStream) {
+      micStream.getTracks().forEach((t) => t.stop())
+      micStream = null
+    }
+    // 停止系统音频媒体流
+    if (sysStream) {
+      sysStream.getTracks().forEach((t) => t.stop())
+      sysStream = null
     }
   }
 
@@ -279,6 +295,7 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
     elapsedSeconds,
     error,
     isRecording,
+    audioSources,
     start,
     stop,
   }
