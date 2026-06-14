@@ -7,9 +7,7 @@ Transcription Agent（转写Agent）
 
 from __future__ import annotations
 
-import io
 import os
-import tempfile
 from typing import Any
 
 import numpy as np
@@ -154,57 +152,61 @@ class TranscriptionAgent:
     async def _transcribe(
         self, audio_data: bytes, meeting_id: str
     ) -> TranscriptResult:
-        """执行实际的语音转写流程"""
+        """执行实际的语音转写流程（PCM → numpy，无需 ffmpeg）。"""
         if self._model is None:
             return self._generate_demo_transcript(meeting_id)
 
         import whisperx
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-            tmp.write(audio_data)
-            tmp.flush()
+        # PCM16 bytes → float32 numpy，避免 ffmpeg 依赖
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Step 1: WhisperX 转写
-            result = self._model.transcribe(
-                tmp.name,
-                batch_size=self.config.batch_size,
-                language=self.config.language,
-            )
+        # Step 1: WhisperX 转写
+        result = self._model.transcribe(
+            audio_np,
+            batch_size=self.config.batch_size,
+            language=self.config.language,
+        )
 
-            # Step 2: 时间戳对齐
-            # WhisperX 自带的时间戳是估计的（±500ms 误差），
-            # wav2vec2 做音素级对齐，把每个词的起止时间压到 ±50ms。这样后面的说话人识别才能准确归属。
-            if self._align_model is None:
+        # Step 2: 时间戳对齐（可选，失败不阻断转写）
+        if self._align_model is None:
+            try:
                 model_a, metadata = whisperx.load_align_model(
                     language_code=self.config.language,
                     device=self.config.device,
                 )
                 self._align_model = (model_a, metadata)
+            except Exception as e:
+                logger.warning(f"Align model load failed ({e}), skipping alignment")
+                self._align_model = None
 
-            aligned = whisperx.align(
-                result["segments"],
-                self._align_model[0],
-                self._align_model[1],
-                tmp.name,
-                self.config.device,
+        if self._align_model is not None:
+            try:
+                aligned = whisperx.align(
+                    result["segments"],
+                    self._align_model[0],
+                    self._align_model[1],
+                    audio_np,
+                    self.config.device,
+                )
+            except Exception as e:
+                logger.warning(f"Alignment failed ({e}), using raw timestamps")
+                aligned = result
+        else:
+            aligned = result
+
+        # Step 3: 说话人识别
+        if self._diarize_pipeline is None and self.config.hf_token:
+            self._diarize_pipeline = whisperx.DiarizationPipeline(
+                use_auth_token=self.config.hf_token,
+                device=self.config.device,
             )
 
-            # Step 3: 说话人识别pyannote 对音频做 speaker embedding + 聚类，
-            # 区分出不同说话人。然后 assign_word_speakers 把每个词归属到具体的人。
-            # 没配 token 时跳过这一步，所有人标记为 "Unknown"
-            if self._diarize_pipeline is None and self.config.hf_token:
-                self._diarize_pipeline = whisperx.DiarizationPipeline(
-                    use_auth_token=self.config.hf_token,
-                    device=self.config.device,
-                )
-
-            if self._diarize_pipeline:
-                diarize_result = self._diarize_pipeline(tmp.name)
-                final = whisperx.assign_word_speakers(
-                    diarize_result, aligned
-                )
-            else:
-                final = aligned
+        if self._diarize_pipeline:
+            diarize_result = self._diarize_pipeline(audio_np)
+            final = whisperx.assign_word_speakers(diarize_result, aligned)
+        else:
+            final = aligned
 
         segments = []
         for seg in final.get("segments", []):
@@ -236,6 +238,7 @@ class TranscriptionAgent:
         对原始音频字节执行转写（独立于 LangGraph state）。
 
         供 ChunkTranscriber 调用，避免依赖 state 字典。
+        PCM 字节直接转 numpy，无需 ffmpeg 或临时文件。
         """
         lang = language or self.config.language
         if self._model is None:
@@ -246,42 +249,52 @@ class TranscriptionAgent:
 
         import whisperx
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-            tmp.write(audio_data)
-            tmp.flush()
+        # PCM16 bytes → float32 numpy (16kHz, mono)，直接传 WhisperX，无需 ffmpeg
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
-            result = self._model.transcribe(
-                tmp.name,
-                batch_size=self.config.batch_size,
-                language=lang,
-            )
+        result = self._model.transcribe(
+            audio_np,
+            batch_size=self.config.batch_size,
+            language=lang,
+        )
 
-            if self._align_model is None:
+        if self._align_model is None:
+            try:
                 model_a, metadata = whisperx.load_align_model(
                     language_code=lang,
                     device=self.config.device,
                 )
                 self._align_model = (model_a, metadata)
+            except Exception as e:
+                logger.warning(f"Align model load failed ({e}), skipping alignment")
+                self._align_model = None  # 标记为不可用
 
-            aligned = whisperx.align(
-                result["segments"],
-                self._align_model[0],
-                self._align_model[1],
-                tmp.name,
-                self.config.device,
+        if self._align_model is not None:
+            try:
+                aligned = whisperx.align(
+                    result["segments"],
+                    self._align_model[0],
+                    self._align_model[1],
+                    audio_np,
+                    self.config.device,
+                )
+            except Exception as e:
+                logger.warning(f"Alignment failed ({e}), using raw timestamps")
+                aligned = result
+        else:
+            aligned = result
+
+        if self._diarize_pipeline is None and self.config.hf_token:
+            self._diarize_pipeline = whisperx.DiarizationPipeline(
+                use_auth_token=self.config.hf_token,
+                device=self.config.device,
             )
 
-            if self._diarize_pipeline is None and self.config.hf_token:
-                self._diarize_pipeline = whisperx.DiarizationPipeline(
-                    use_auth_token=self.config.hf_token,
-                    device=self.config.device,
-                )
-
-            if self._diarize_pipeline:
-                diarize_result = self._diarize_pipeline(tmp.name)
-                final = whisperx.assign_word_speakers(diarize_result, aligned)
-            else:
-                final = aligned
+        if self._diarize_pipeline:
+            diarize_result = self._diarize_pipeline(audio_np)
+            final = whisperx.assign_word_speakers(diarize_result, aligned)
+        else:
+            final = aligned
 
         segments = []
         for seg in final.get("segments", []):
