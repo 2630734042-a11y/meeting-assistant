@@ -29,11 +29,17 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
   const elapsedSeconds = ref(0)
   const error = ref<string | null>(null)
   const isRecording = ref(false)
+  const audioSources = ref<'mic_only' | 'mic_and_system'>('mic_only')
 
   let ws: WebSocket | null = null
   let audioContext: AudioContext | null = null
   let processor: ScriptProcessorNode | null = null
-  let stream: MediaStream | null = null
+  let micStream: MediaStream | null = null
+  let sysStream: MediaStream | null = null
+  let micSource: MediaStreamAudioSourceNode | null = null
+  let sysSource: MediaStreamAudioSourceNode | null = null
+  let micGain: GainNode | null = null
+  let sysGain: GainNode | null = null
   let timer: ReturnType<typeof setInterval> | null = null
 
   // ---- PCM 转换 ----
@@ -107,10 +113,10 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
     return socket
   }
 
-  // ---- 麦克风 ----
-  async function startMic(): Promise<void> {
+  // ---- 麦克风采流（不含 AudioContext 设置）----
+  async function captureMic(): Promise<MediaStream> {
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
+      return await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
           sampleRate: 16000,
@@ -118,20 +124,6 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
           noiseSuppression: true,
         },
       })
-
-      audioContext = new AudioContext({ sampleRate: 16000 })
-      const source = audioContext.createMediaStreamSource(stream)
-      processor = audioContext.createScriptProcessor(4096, 1, 1)
-
-      processor.onaudioprocess = (e: AudioProcessingEvent) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN || !isRecording.value) return
-        const inputData = e.inputBuffer.getChannelData(0)
-        const pcm = float32ToPCM16(inputData)
-        ws.send(pcm)
-      }
-
-      source.connect(processor)
-      processor.connect(audioContext.destination)
     } catch (err: any) {
       if (err.name === 'NotAllowedError') {
         error.value = '麦克风权限被拒绝，请在浏览器设置中允许麦克风访问'
@@ -140,6 +132,69 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
       }
       throw err
     }
+  }
+
+  // ---- 系统音频采集（getDisplayMedia）----
+  async function startSystemAudio(): Promise<MediaStream | null> {
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        audio: true,
+        video: { width: 1, height: 1 },
+      })
+      // 立即 stop 视频轨释放带宽
+      const videoTracks = displayStream.getVideoTracks()
+      for (const t of videoTracks) {
+        t.stop()
+        displayStream.removeTrack(t)
+      }
+      // 监听用户中途停止共享
+      const audioTrack = displayStream.getAudioTracks()[0]
+      if (audioTrack) {
+        audioTrack.onended = () => {
+          // 系统音频停止 → 降级为仅麦克风
+          if (sysGain) sysGain.gain.value = 0
+          if (micGain) micGain.gain.value = 1.0
+          audioSources.value = 'mic_only'
+        }
+      }
+      return displayStream
+    } catch (e) {
+      return null // 用户取消或浏览器不支持 → 降级
+    }
+  }
+
+  // ---- AudioContext 管线搭建 ----
+  function setupAudioPipeline(mic: MediaStream, sys: MediaStream | null): void {
+    audioContext = new AudioContext({ sampleRate: 16000 })
+    processor = audioContext.createScriptProcessor(4096, 1, 1)
+
+    // 麦克风链路: micStream → micGain → processor
+    micSource = audioContext.createMediaStreamSource(mic)
+    micGain = audioContext.createGain()
+    micGain.gain.value = sys ? 0.5 : 1.0  // 双路时减半防止溢出
+    micSource.connect(micGain)
+    micGain.connect(processor)
+
+    // 系统音频链路（可选）: sysStream → sysGain → processor
+    if (sys) {
+      sysSource = audioContext.createMediaStreamSource(sys)
+      sysGain = audioContext.createGain()
+      sysGain.gain.value = 0.5
+      sysSource.connect(sysGain)
+      sysGain.connect(processor)
+      audioSources.value = 'mic_and_system'
+    } else {
+      audioSources.value = 'mic_only'
+    }
+
+    // PCM 发送 — AudioContext 自动混音，inputBuffer 已是混合结果
+    processor.onaudioprocess = (e: AudioProcessingEvent) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN || !isRecording.value) return
+      const inputData = e.inputBuffer.getChannelData(0)
+      ws.send(float32ToPCM16(inputData))
+    }
+
+    processor.connect(audioContext.destination)
   }
 
   // ---- 计时器 ----
