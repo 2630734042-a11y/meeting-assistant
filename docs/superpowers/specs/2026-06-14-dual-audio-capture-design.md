@@ -27,7 +27,8 @@
 
 - 两路音频各自进入独立的 `MediaStreamSource`
 - 各接一个 `GainNode(gain=0.5)` 防止叠加后溢出
-- 汇入同一个 `ScriptProcessor`，在 `onaudioprocess` 回调中进行逐样本混音
+- 汇入同一个 `ScriptProcessor` ← Web Audio API **自动混音**（多源 connect 到同一节点时内置求和）
+- `onaudioprocess` 收到的 `inputBuffer` 已是混音后的信号，直接转 PCM 发送即可
 - 后端 `/ws/live/{meeting_id}` 收到的仍是单路 PCM 二进制帧，**零改动**
 
 ## 改动范围
@@ -65,15 +66,9 @@ async function startSystemAudio(): Promise<MediaStream | null> {
   }
 }
 
-function mixBuffers(a: Float32Array, b: Float32Array): Float32Array {
-  const len = Math.min(a.length, b.length)
-  const out = new Float32Array(len)
-  for (let i = 0; i < len; i++) {
-    const s = a[i] + b[i]
-    out[i] = Math.max(-1, Math.min(1, s))
-  }
-  return out
-}
+// 注：不需要手动 mixBuffers。Web Audio API 中多个 source 连接到同一个
+// ScriptProcessor 时，AudioContext 会自动对信号求和（auto-mix）。
+// ScriptProcessor.onaudioprocess 拿到的 inputBuffer 已经是混音后的结果。
 ```
 
 ### start() 流程变更
@@ -91,9 +86,8 @@ function mixBuffers(a: Float32Array, b: Float32Array): Float32Array {
    - 两路连接到各自的 GainNode → ScriptProcessor
    - audioSources = 'mic_and_system'
 8. ScriptProcessor.onaudioprocess:
-   - 如果有两路: mixed = mixBuffers(micData, sysData)
-   - 如果仅麦克风: mixed = micData
-   - ws.send(float32ToPCM16(mixed))
+   - 拿到的 inputBuffer 已是 AudioContext 自动混音结果（单路或双路）
+   - 直接 float32ToPCM16(inputBuffer) → ws.send(pcm)
 9. isRecording = true; startTimer()
 ```
 
@@ -106,7 +100,7 @@ function mixBuffers(a: Float32Array, b: Float32Array): Float32Array {
 | 用户拒绝麦克风 | `getUserMedia` 抛 `NotAllowedError` | 显示错误，不启动会话 |
 | 用户取消标签页共享 | `getDisplayMedia` 抛 `AbortError` | 降级为仅麦克风，`audioSources = 'mic_only'` |
 | 浏览器不支持系统音频采集 | `getDisplayMedia` 不支持 `audio: true` | 同上 |
-| 音频帧长度不一致 | 两个 source 的 `onaudioprocess` 帧长不同 | `mixBuffers` 取较短长度 |
+| 音频帧长度不一致 | 两个 source 的 `onaudioprocess` 帧长不同 | AudioContext 以固定 bufferSize(4096) 统一采样，不会出现不一致 |
 | 标签页共享中途被用户停止 | `MediaStreamTrack.onended` 触发 | 自动切回仅麦克风，不移除已连接的 source 节点 |
 
 ## 测试
@@ -114,7 +108,7 @@ function mixBuffers(a: Float32Array, b: Float32Array): Float32Array {
 | 测试点 | 方式 |
 |--------|------|
 | 仅麦克风（降级路径） | 现有测试覆盖 |
-| 双路混音无溢出 | 手动：开音乐 + 说话，检查 PCM 值在 [-1, 1] |
+| 双路混音 AudioContext 自动混合 | 手动：开音乐 + 说话，检查 PCM 数据不溢出 [-1, 1] |
 | 系统音频采集取消 | 点击"取消"共享对话框，验证降级 |
 | Chrome/Edge 兼容性 | `getDisplayMedia({ audio: true })` 在 Chrome 74+/Edge 79+ 支持 |
 | 视频轨释放 | 验证共享结束后 1x1 视频 track 已 stop |
