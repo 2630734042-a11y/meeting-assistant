@@ -35,10 +35,10 @@ class LiveSessionManager:
     生命周期:
         WebSocket 连接 → start → 音频流 → stop → 最终分析 → 断开
 
-    三个 asyncio.Task:
-        1. audio_task:   WebSocket 接收音频 ⇒ AudioBuffer.feed()
-        2. transcribe_task: AudioBuffer.process() ⇒ ChunkTranscriber ⇒ push
-        3. analyze_timer_task:  定时检查 ⇒ IncrementalAnalyzer ⇒ push
+    并发模型:
+        1. _receive_loop (主协程):  统一接收 WebSocket 消息，路由 binary→buffer / stop→结束
+        2. transcribe_task (后台):  AudioBuffer.process() ⇒ ChunkTranscriber ⇒ push
+        3. analyze_timer_task (后台): 定时检查 ⇒ IncrementalAnalyzer ⇒ push
     """
 
     def __init__(
@@ -92,12 +92,11 @@ class LiveSessionManager:
         )
 
         self._tasks = [
-            asyncio.create_task(self._audio_loop()),
             asyncio.create_task(self._transcribe_loop()),
             asyncio.create_task(self._analyze_timer_loop()),
         ]
 
-        await self._message_loop()
+        await self._receive_loop()
 
     async def _wait_for_start(self) -> bool:
         """等待 start 消息（超时 30 秒）。"""
@@ -121,9 +120,12 @@ class LiveSessionManager:
             logger.error(f"LiveSession start error: {e}")
             return False
 
-    async def _audio_loop(self) -> None:
-        """后台任务：接收音频帧并喂入 buffer。"""
-        logger.debug("audio_loop started")
+    async def _receive_loop(self) -> None:
+        """
+        统一的消息接收循环（解决 _audio_loop / _message_loop 并发 receive() 竞态）。
+        路由：binary → buffer.feed() / text:stop → _handle_stop() / text:ping → pong
+        """
+        logger.debug("receive_loop started")
         try:
             while self._running:
                 raw = await asyncio.wait_for(self._ws.receive(), timeout=1.0)
@@ -131,14 +133,20 @@ class LiveSessionManager:
                     self._buffer.feed(raw["bytes"])
                 elif "text" in raw and raw["text"]:
                     msg = json.loads(raw["text"])
-                    if msg.get("type") == "ping":
+                    msg_type = msg.get("type", "")
+                    if msg_type == "stop":
+                        logger.info(f"LiveSession received stop: {self.meeting_id}")
+                        await self._handle_stop()
+                        break
+                    elif msg_type == "ping":
                         await self._ws.send_json({"type": "pong"})
         except asyncio.TimeoutError:
             pass
         except Exception as e:
             if self._running:
-                logger.error(f"audio_loop error: {e}")
-        logger.debug("audio_loop stopped")
+                logger.error(f"receive_loop error: {e}")
+                await self._handle_stop()
+        logger.debug("receive_loop stopped")
 
     async def _transcribe_loop(self) -> None:
         """后台任务：持续从 buffer 取 chunk → 转写 → 推送。"""
@@ -185,23 +193,6 @@ class LiveSessionManager:
             if self._running:
                 logger.error(f"analyze_timer_loop error: {e}")
         logger.debug("analyze_timer_loop stopped")
-
-    async def _message_loop(self) -> None:
-        """主消息循环：处理 stop。"""
-        try:
-            while self._running:
-                raw = await asyncio.wait_for(self._ws.receive(), timeout=1.0)
-                if "text" in raw and raw["text"]:
-                    msg = json.loads(raw["text"])
-                    if msg.get("type") == "stop":
-                        logger.info(f"LiveSession received stop: {self.meeting_id}")
-                        await self._handle_stop()
-                        break
-        except asyncio.TimeoutError:
-            pass
-        except Exception as e:
-            logger.error(f"message_loop error: {e}")
-            await self._handle_stop()
 
     async def _handle_stop(self) -> None:
         """停止会话：flush → 最终分析 → 发送 completed。"""
