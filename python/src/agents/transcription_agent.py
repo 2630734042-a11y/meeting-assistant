@@ -31,6 +31,7 @@ class TranscriptionConfig:
         language: str = "zh",
         hf_token: str = "",
         batch_size: int = 16,
+        vad_method: str = "silero",
     ):
         self.model_size = os.getenv("WHISPER_MODEL_SIZE", model_size)
         self.device = os.getenv("WHISPER_DEVICE", device)
@@ -38,6 +39,7 @@ class TranscriptionConfig:
         self.language = os.getenv("WHISPER_LANGUAGE", language)
         self.hf_token = hf_token or os.getenv("HF_TOKEN", "")
         self.batch_size = batch_size
+        self.vad_method = os.getenv("WHISPER_VAD_METHOD", vad_method)
 
 
 class TranscriptionAgent:
@@ -60,9 +62,13 @@ class TranscriptionAgent:
     def __init__(self, config: TranscriptionConfig | None = None):
         self.config = config or TranscriptionConfig()
         self._model = None
-        self._align_model = None
+        self._align_model = None     # None=未尝试, False=尝试失败, tuple=(model, metadata)
         self._diarize_pipeline = None
         self._initialized = False
+
+        # 首次成功标记（全链路诊断用）
+        self._first_whisper_transcribe = True
+        self._first_align = True
 
     def _lazy_init(self):
         """
@@ -80,12 +86,17 @@ class TranscriptionAgent:
 
             logger.info(
                 f"Loading WhisperX model: {self.config.model_size} "
-                f"on {self.config.device}"
+                f"on {self.config.device}, vad={self.config.vad_method}"
             )
             self._model = whisperx.load_model(
                 self.config.model_size,
                 self.config.device,
                 compute_type=self.config.compute_type,
+                vad_method=self.config.vad_method,
+                vad_options={
+                    "vad_onset": 0.3,   # 更低→更敏感，默认0.5
+                    "vad_offset": 0.2,  # 更低→更少填充静音
+                },
             )
             self._initialized = True
             logger.info("WhisperX model loaded successfully")
@@ -168,7 +179,7 @@ class TranscriptionAgent:
             language=self.config.language,
         )
 
-        # Step 2: 时间戳对齐（可选，失败不阻断转写）
+        # Step 2: 时间戳对齐（可选，失败不阻断转写，不重试）
         if self._align_model is None:
             try:
                 model_a, metadata = whisperx.load_align_model(
@@ -177,10 +188,10 @@ class TranscriptionAgent:
                 )
                 self._align_model = (model_a, metadata)
             except Exception as e:
-                logger.warning(f"Align model load failed ({e}), skipping alignment")
-                self._align_model = None
+                logger.warning(f"Align model load failed ({e}), skipping alignment for session")
+                self._align_model = False  # 标记失败，不再重试
 
-        if self._align_model is not None:
+        if self._align_model and self._align_model is not False:
             try:
                 aligned = whisperx.align(
                     result["segments"],
@@ -195,14 +206,18 @@ class TranscriptionAgent:
         else:
             aligned = result
 
-        # Step 3: 说话人识别
+        # Step 3: 说话人识别（可选，失败不阻断转写）
         if self._diarize_pipeline is None and self.config.hf_token:
-            self._diarize_pipeline = whisperx.DiarizationPipeline(
-                use_auth_token=self.config.hf_token,
-                device=self.config.device,
-            )
+            try:
+                self._diarize_pipeline = whisperx.DiarizationPipeline(
+                    use_auth_token=self.config.hf_token,
+                    device=self.config.device,
+                )
+            except Exception as e:
+                logger.warning(f"Diarization pipeline load failed ({e}), skipping speaker recognition")
+                self._diarize_pipeline = False
 
-        if self._diarize_pipeline:
+        if self._diarize_pipeline and self._diarize_pipeline is not False:
             diarize_result = self._diarize_pipeline(audio_np)
             final = whisperx.assign_word_speakers(diarize_result, aligned)
         else:
@@ -258,6 +273,26 @@ class TranscriptionAgent:
             language=lang,
         )
 
+        if self._first_whisper_transcribe:
+            seg_count = len(result.get("segments", []))
+            logger.info(
+                f"[⑩ WhisperX.transcribe] 首次转写完成 | "
+                f"segments={seg_count}, "
+                f"audio_len={len(audio_np)} samples ({len(audio_np)/16000:.1f}s)"
+            )
+            self._first_whisper_transcribe = False
+
+        # 诊断：转写结果为空时输出音频统计，帮助定位问题
+        if len(result.get("segments", [])) == 0:
+            logger.warning(
+                f"WhisperX returned 0 segments: "
+                f"audio_dur={len(audio_np)/16000:.1f}s, "
+                f"amp_range=[{audio_np.min():.4f}, {audio_np.max():.4f}], "
+                f"rms={np.sqrt(np.mean(audio_np**2)):.4f}, "
+                f"vad={self.config.vad_method}"
+            )
+
+        # Step 2: 时间戳对齐（可选，失败不阻断转写，不重试）
         if self._align_model is None:
             try:
                 model_a, metadata = whisperx.load_align_model(
@@ -266,10 +301,10 @@ class TranscriptionAgent:
                 )
                 self._align_model = (model_a, metadata)
             except Exception as e:
-                logger.warning(f"Align model load failed ({e}), skipping alignment")
-                self._align_model = None  # 标记为不可用
+                logger.warning(f"Align model load failed ({e}), skipping alignment for session")
+                self._align_model = False  # 标记失败，不再重试
 
-        if self._align_model is not None:
+        if self._align_model and self._align_model is not False:
             try:
                 aligned = whisperx.align(
                     result["segments"],
@@ -278,6 +313,12 @@ class TranscriptionAgent:
                     audio_np,
                     self.config.device,
                 )
+                if self._first_align:
+                    logger.info(
+                        f"[⑪ whisperx.align] 首次时间戳对齐成功 | "
+                        f"aligned_segments={len(aligned.get('segments', []))}"
+                    )
+                    self._first_align = False
             except Exception as e:
                 logger.warning(f"Alignment failed ({e}), using raw timestamps")
                 aligned = result
@@ -285,12 +326,16 @@ class TranscriptionAgent:
             aligned = result
 
         if self._diarize_pipeline is None and self.config.hf_token:
-            self._diarize_pipeline = whisperx.DiarizationPipeline(
-                use_auth_token=self.config.hf_token,
-                device=self.config.device,
-            )
+            try:
+                self._diarize_pipeline = whisperx.DiarizationPipeline(
+                    use_auth_token=self.config.hf_token,
+                    device=self.config.device,
+                )
+            except Exception as e:
+                logger.warning(f"Diarization pipeline load failed ({e}), skipping speaker recognition")
+                self._diarize_pipeline = False
 
-        if self._diarize_pipeline:
+        if self._diarize_pipeline and self._diarize_pipeline is not False:
             diarize_result = self._diarize_pipeline(audio_np)
             final = whisperx.assign_word_speakers(diarize_result, aligned)
         else:

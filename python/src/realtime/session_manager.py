@@ -52,13 +52,25 @@ class LiveSessionManager:
         self._ws = websocket
         self._llm = llm_client or LLMClient()
 
-        self._buffer = AudioBuffer()
+        self._buffer = AudioBuffer(
+            silence_threshold_ms=800,
+            max_chunk_ms=5000,      # 5秒强制切分，更快出第一块
+            min_speech_ms=500,      # 0.5秒语音即可，减少丢弃短句
+        )
         self._transcriber: ChunkTranscriber | None = None
         self._analyzer: IncrementalAnalyzer | None = None
 
         self._running = False
         self._started_at: float = 0.0
         self._tasks: list[asyncio.Task] = []
+
+        # 首次成功标记（全链路诊断用）
+        self._first_feed = True
+        self._first_chunk = True
+        self._first_transcribe_call = True
+        self._first_push = True
+        self._first_analyzer_feed = True
+        self._first_force_analyze = True
 
         self.final_transcript: TranscriptResult | None = None
         self.final_summary: MeetingSummary | None = None
@@ -126,11 +138,33 @@ class LiveSessionManager:
         路由：binary → buffer.feed() / text:stop → _handle_stop() / text:ping → pong
         """
         logger.debug("receive_loop started")
+        _binary_count = 0
+        _binary_bytes = 0
         try:
             while self._running:
-                raw = await asyncio.wait_for(self._ws.receive(), timeout=1.0)
+                try:
+                    raw = await asyncio.wait_for(self._ws.receive(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue  # 1秒无数据，正常轮询，继续等待
+
                 if "bytes" in raw and raw["bytes"]:
-                    self._buffer.feed(raw["bytes"])
+                    data = raw["bytes"]
+                    self._buffer.feed(data)
+                    if self._first_feed:
+                        logger.info(
+                            f"[⑥ buffer.feed] 首次收到音频数据 | "
+                            f"bytes={len(data)}, "
+                            f"buffer_size={len(self._buffer._buffer)} bytes"
+                        )
+                        self._first_feed = False
+                    _binary_count += 1
+                    _binary_bytes += len(data)
+                    if _binary_count % 100 == 0:
+                        logger.info(
+                            f"[AUDIO-IN] received {_binary_count} binary msgs, "
+                            f"{_binary_bytes} bytes total, "
+                            f"buffer_size={len(self._buffer._buffer)} bytes"
+                        )
                 elif "text" in raw and raw["text"]:
                     msg = json.loads(raw["text"])
                     msg_type = msg.get("type", "")
@@ -140,8 +174,6 @@ class LiveSessionManager:
                         break
                     elif msg_type == "ping":
                         await self._ws.send_json({"type": "pong"})
-        except asyncio.TimeoutError:
-            pass
         except Exception as e:
             if self._running:
                 logger.error(f"receive_loop error: {e}")
@@ -151,22 +183,59 @@ class LiveSessionManager:
     async def _transcribe_loop(self) -> None:
         """后台任务：持续从 buffer 取 chunk → 转写 → 推送。"""
         logger.debug("transcribe_loop started")
+        _chunk_count = 0
+        _null_count = 0
         try:
             while self._running:
                 chunk = self._buffer.process()
                 if chunk is not None and self._transcriber:
+                    _chunk_count += 1
+                    if self._first_chunk:
+                        logger.info(
+                            f"[⑦ buffer.process] 首次产出音频块 | "
+                            f"{len(chunk.data)} bytes, offset={chunk.offset_ms}ms, "
+                            f"speech={chunk.is_speech}"
+                        )
+                        self._first_chunk = False
+                    logger.info(
+                        f"[CHUNK] #{_chunk_count}: {len(chunk.data)} bytes, "
+                        f"offset={chunk.offset_ms}ms, speech={chunk.is_speech}, "
+                        f"buffer_remaining={len(self._buffer._buffer)} bytes"
+                    )
+                    if self._first_transcribe_call:
+                        logger.info(
+                            f"[⑧ transcribe_chunk] 首次调用转写 | "
+                            f"chunk_id={chunk.chunk_id}, bytes={len(chunk.data)}"
+                        )
+                        self._first_transcribe_call = False
                     segments_before = self._transcriber.segment_count
                     await self._transcriber.transcribe_chunk(chunk)
                     segments_after = self._transcriber.segment_count
+                    logger.info(
+                        f"[TRANSCRIBE] chunk #{_chunk_count}: "
+                        f"segments {segments_before}→{segments_after} "
+                        f"(+{segments_after - segments_before})"
+                    )
 
                     if self._analyzer and segments_after > segments_before:
-                        new_count = segments_after - segments_before
-                        new_texts = [
-                            self._transcriber._accumulated_segments[i].text
-                            for i in range(segments_before, segments_after)
-                        ]
+                        new_texts = self._transcriber.get_new_segment_texts(segments_before)
                         await self._analyzer.on_new_sentences(new_texts)
+                        if self._first_analyzer_feed:
+                            logger.info(
+                                f"[⑭ analyzer.on_new_sentences] 首次喂入分析器 | "
+                                f"sentences={len(new_texts)}, "
+                                f"first='{new_texts[0][:50] if new_texts else ''}...'"
+                            )
+                            self._first_analyzer_feed = False
                 else:
+                    _null_count += 1
+                    if _null_count % 200 == 0:  # ~10 seconds
+                        total_frames = len(self._buffer._buffer) // self._buffer._frame_bytes
+                        logger.debug(
+                            f"[AUDIO-BUF] {_null_count} polls without chunk, "
+                            f"buffer={len(self._buffer._buffer)} bytes, "
+                            f"frames={total_frames}"
+                        )
                     await asyncio.sleep(0.05)
         except Exception as e:
             if self._running:
@@ -182,12 +251,18 @@ class LiveSessionManager:
                 if not self._analyzer or self._analyzer.pending_count <= 0:
                     continue
                 ref_time = (
-                    self._analyzer._last_analysis_time
-                    if self._analyzer._last_analysis_time > 0
+                    self._analyzer.last_analysis_time
+                    if self._analyzer.last_analysis_time > 0
                     else self._started_at
                 )
                 elapsed = time.time() - ref_time
                 if elapsed >= IncrementalAnalyzer.TRIGGER_TIME_SECONDS:
+                    if self._first_force_analyze:
+                        logger.info(
+                            f"[⑮ analyzer.force_analyze] 首次触发LLM分析 | "
+                            f"elapsed={elapsed:.1f}s"
+                        )
+                        self._first_force_analyze = False
                     await self._analyzer.force_analyze()
         except Exception as e:
             if self._running:
@@ -235,6 +310,13 @@ class LiveSessionManager:
     # ---- WebSocket 推送回调 ----
 
     async def _on_transcript_sentence(self, segment) -> None:
+        if self._first_push:
+            logger.info(
+                f"[⑬ _on_transcript_sentence] 首次推送转写结果到前端 | "
+                f"speaker={segment.speaker}, text='{segment.text[:50]}...', "
+                f"start={segment.start}s"
+            )
+            self._first_push = False
         try:
             await self._ws.send_json({
                 "type": "transcript_delta",

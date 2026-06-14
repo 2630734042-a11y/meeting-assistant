@@ -56,6 +56,10 @@ class AudioBuffer:
         self.max_chunk_ms = max_chunk_ms
         self.min_speech_ms = min_speech_ms
 
+        # 诊断统计
+        self._total_frames_fed = 0
+        self._speech_frames_detected = 0
+
         self._buffer = bytearray()
         self._chunk_counter = 0
         self._total_processed_ms = 0

@@ -83,11 +83,11 @@ async function handleUpload({ file }: UploadCustomRequestOptions) {
   const meetingId = meetingResp.meeting_id
   stage.value = 1
 
-  const fileName = (file as File).name || 'unknown'
+  const fileName = (file as unknown as File).name || 'unknown'
   const isVideo = /\.(mp4|mkv|webm|avi|mov|flv|wmv)$/i.test(fileName)
   const resp = isVideo
-    ? await api.uploadVideo(meetingId, file as File)
-    : await api.uploadAudio(meetingId, file as File)
+    ? await api.uploadVideo(meetingId, file as unknown as File)
+    : await api.uploadAudio(meetingId, file as unknown as File)
 
   if (resp.status === 'failed') {
     alert('处理失败: ' + (resp.errors?.join(', ') || '未知错误'))

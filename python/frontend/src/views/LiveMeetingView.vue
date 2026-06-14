@@ -120,7 +120,6 @@ const route = useRoute()
 const meetingId = (route.params.meetingId as string) || `live-${Date.now()}`
 
 const {
-  connected,
   transcript,
   summary,
   actions,

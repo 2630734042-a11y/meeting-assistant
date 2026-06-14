@@ -41,6 +41,10 @@ class ChunkTranscriber:
         self._accumulated_text: str = ""
         self._chunk_count = 0
 
+        # 首次成功标记（全链路诊断用）
+        self._first_agent_call = True
+        self._first_result = True
+
     @property
     def accumulated_text(self) -> str:
         """获取累积的纯文本全文（供 IncrementalAnalyzer 使用）。"""
@@ -50,6 +54,20 @@ class ChunkTranscriber:
     def segment_count(self) -> int:
         """已转写的句子总数。"""
         return len(self._accumulated_segments)
+
+    def get_new_segment_texts(self, from_index: int) -> list[str]:
+        """
+        获取从指定索引开始的新句子文本（含说话人前缀）。
+
+        供外部（如 IncrementalAnalyzer）使用，避免直接访问 _accumulated_segments。
+
+        Returns:
+            格式化文本列表：["张总: 好的，我们继续讨论。", ...]
+        """
+        return [
+            f"{self._accumulated_segments[i].speaker}: {self._accumulated_segments[i].text}"
+            for i in range(from_index, len(self._accumulated_segments))
+        ]
 
     async def transcribe_chunk(self, chunk: AudioChunk) -> list[TranscriptSegment]:
         """
@@ -68,7 +86,25 @@ class ChunkTranscriber:
         )
 
         try:
+            if self._first_agent_call:
+                logger.info(
+                    f"[⑨ transcribe_bytes] 首次调用WhisperX转写 | "
+                    f"chunk_bytes={len(chunk.data)}"
+                )
+                self._first_agent_call = False
             result = await self._agent.transcribe_bytes(chunk.data)
+            if self._first_result and result.segments:
+                logger.info(
+                    f"[⑫ TranscriptResult] 首次转写结果返回 | "
+                    f"segments={len(result.segments)}, "
+                    f"text='{result.full_text[:60]}...'"
+                )
+                self._first_result = False
+            logger.info(
+                f"[CHUNK-TRANS] #{self._chunk_count}: "
+                f"got {len(result.segments)} segments, "
+                f"full_text={result.full_text[:80] if result.full_text else '(empty)'}"
+            )
         except Exception as e:
             logger.error(f"ChunkTranscriber error on chunk #{chunk.chunk_id}: {e}")
             return []

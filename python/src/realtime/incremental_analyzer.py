@@ -108,6 +108,11 @@ class IncrementalAnalyzer:
     def pending_count(self) -> int:
         return self._pending_count
 
+    @property
+    def last_analysis_time(self) -> float:
+        """上次分析的时间戳（秒），0 表示尚未分析。"""
+        return self._last_analysis_time
+
     async def on_new_sentences(self, sentences: list[str]) -> None:
         """收到新句子时调用。"""
         self._pending_count += len(sentences)

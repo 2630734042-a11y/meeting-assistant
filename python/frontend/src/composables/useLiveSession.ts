@@ -65,11 +65,17 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
       connected.value = true
     }
 
+    let _msgCount = 0
     socket.onmessage = (event: MessageEvent) => {
       if (event.data instanceof ArrayBuffer) return
 
       try {
         const msg = JSON.parse(event.data)
+        _msgCount++
+        if (_msgCount <= 8 || _msgCount % 20 === 0) {
+          const preview = msg.type === 'transcript_delta' ? (msg.data as any)?.text?.slice(0, 30) : ''
+          console.log(`[WS msg #${_msgCount}] type=${msg.type}`, preview ? `text="${preview}..."` : '')
+        }
         switch (msg.type) {
           case 'connected':
             connected.value = true
@@ -114,10 +120,17 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
     return socket
   }
 
+  // ---- 首次成功标记 ----
+  let _firstMicCapture = true
+  let _firstSysAudio = true
+  let _firstAudioContext = true
+  let _firstAudioProcess = true
+  let _firstWSSend = true
+
   // ---- 麦克风采流（不含 AudioContext 设置）----
   async function captureMic(): Promise<MediaStream> {
     try {
-      return await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
           sampleRate: 16000,
@@ -125,6 +138,12 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
           noiseSuppression: true,
         },
       })
+      if (_firstMicCapture) {
+        const track = stream.getAudioTracks()[0]
+        console.log('[① captureMic] 麦克风采流成功:', track?.label, '| sampleRate:', track?.getSettings().sampleRate)
+        _firstMicCapture = false
+      }
+      return stream
     } catch (err: any) {
       if (err.name === 'NotAllowedError') {
         error.value = '麦克风权限被拒绝，请在浏览器设置中允许麦克风访问'
@@ -158,6 +177,11 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
           audioSources.value = 'mic_only'
         }
       }
+      if (_firstSysAudio) {
+        const sysTrack = displayStream.getAudioTracks()[0]
+        console.log('[② startSystemAudio] 系统音频采流成功:', sysTrack?.label, '| sampleRate:', sysTrack?.getSettings().sampleRate)
+        _firstSysAudio = false
+      }
       return displayStream
     } catch (e) {
       return null // 用户取消或浏览器不支持 → 降级
@@ -167,6 +191,10 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
   // ---- AudioContext 管线搭建 ----
   function setupAudioPipeline(mic: MediaStream, sys: MediaStream | null): void {
     audioContext = new AudioContext({ sampleRate: 16000 })
+    if (_firstAudioContext) {
+      console.log('[③ AudioContext] 创建成功 | sampleRate:', audioContext.sampleRate, '| state:', audioContext.state)
+      _firstAudioContext = false
+    }
     processor = audioContext.createScriptProcessor(4096, 1, 1)
 
     // 麦克风链路: micStream → micGain → processor
@@ -190,12 +218,35 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
 
     // PCM 发送 — AudioContext 自动混音，inputBuffer 已是混合结果
     processor.onaudioprocess = (e: AudioProcessingEvent) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN || !isRecording.value) return
       const inputData = e.inputBuffer.getChannelData(0)
-      ws.send(float32ToPCM16(inputData))
+
+      // ④ 必须在守卫之前，否则回调触发了也看不到
+      if (_firstAudioProcess) {
+        const rms = Math.sqrt(inputData.reduce((sum, v) => sum + v * v, 0) / inputData.length)
+        console.log('[④ onaudioprocess] 首次触发 | samples:', inputData.length,
+          '| rms:', rms.toFixed(4), '| ws:', ws?.readyState, '| isRecording:', isRecording.value)
+        _firstAudioProcess = false
+      }
+
+      if (!ws || ws.readyState !== WebSocket.OPEN || !isRecording.value) return
+      const pcm = float32ToPCM16(inputData)
+      ws.send(pcm)
+      if (_firstWSSend) {
+        console.log('[⑤ ws.send] 首次PCM发送成功 | bytes:', pcm.byteLength)
+        _firstWSSend = false
+      }
     }
 
     processor.connect(audioContext.destination)
+
+    // 确保 AudioContext 在 running 状态（Safari/Chrome 可能 suspend）
+    if (audioContext.state === 'suspended') {
+      console.log('[③ AudioContext] 状态为 suspended，尝试 resume...')
+      const ctx = audioContext
+      ctx.resume().then(() => {
+        console.log('[③ AudioContext] resume 成功, state:', ctx.state)
+      })
+    }
   }
 
   // ---- 计时器 ----
@@ -239,8 +290,8 @@ export function useLiveSession(meetingId: string): LiveSessionState & {
 
     micStream = await captureMic()             // 必须成功，否则抛错
     sysStream = await startSystemAudio()       // 可选，失败返回 null → 降级
+    isRecording.value = true                   // 必须在 pipeline 前，否则 onaudioprocess 检查不过
     setupAudioPipeline(micStream, sysStream)
-    isRecording.value = true
     startTimer()
   }
 

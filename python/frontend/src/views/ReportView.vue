@@ -1,6 +1,6 @@
 <template>
   <div>
-    <n-page-header @back="router.back()">
+    <n-page-header @back="$router.back()">
       <template #title>会议报告 - {{ meetingId }}</template>
     </n-page-header>
 
