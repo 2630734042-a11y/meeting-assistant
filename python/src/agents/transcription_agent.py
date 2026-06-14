@@ -229,6 +229,129 @@ class TranscriptionAgent:
             full_text=full_text,
         )
 
+    async def transcribe_bytes(
+        self, audio_data: bytes, language: str | None = None
+    ) -> TranscriptResult:
+        """
+        对原始音频字节执行转写（独立于 LangGraph state）。
+
+        供 ChunkTranscriber 调用，避免依赖 state 字典。
+        """
+        lang = language or self.config.language
+        if self._model is None:
+            self._lazy_init()
+
+        if self._model is None:
+            return self._generate_demo_chunk_transcript(audio_data, lang)
+
+        import whisperx
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+            tmp.write(audio_data)
+            tmp.flush()
+
+            result = self._model.transcribe(
+                tmp.name,
+                batch_size=self.config.batch_size,
+                language=lang,
+            )
+
+            if self._align_model is None:
+                model_a, metadata = whisperx.load_align_model(
+                    language_code=lang,
+                    device=self.config.device,
+                )
+                self._align_model = (model_a, metadata)
+
+            aligned = whisperx.align(
+                result["segments"],
+                self._align_model[0],
+                self._align_model[1],
+                tmp.name,
+                self.config.device,
+            )
+
+            if self._diarize_pipeline is None and self.config.hf_token:
+                self._diarize_pipeline = whisperx.DiarizationPipeline(
+                    use_auth_token=self.config.hf_token,
+                    device=self.config.device,
+                )
+
+            if self._diarize_pipeline:
+                diarize_result = self._diarize_pipeline(tmp.name)
+                final = whisperx.assign_word_speakers(diarize_result, aligned)
+            else:
+                final = aligned
+
+        segments = []
+        for seg in final.get("segments", []):
+            segments.append(
+                TranscriptSegment(
+                    speaker=seg.get("speaker", "Unknown"),
+                    text=seg.get("text", "").strip(),
+                    start=seg.get("start", 0.0),
+                    end=seg.get("end", 0.0),
+                    confidence=seg.get("confidence", 0.0),
+                )
+            )
+
+        duration = segments[-1].end if segments else 0.0
+        full_text = " ".join(s.text for s in segments)
+
+        return TranscriptResult(
+            meeting_id="chunk",
+            segments=segments,
+            language=lang,
+            duration_seconds=duration,
+            full_text=full_text,
+        )
+
+    @staticmethod
+    def _generate_demo_chunk_transcript(
+        audio_data: bytes, language: str
+    ) -> TranscriptResult:
+        """
+        为 chunk 生成模拟转写 —— 模型未加载时的降级。
+        用音频长度推算 demo 的句子数。
+        """
+        estimated_duration = len(audio_data) / 32000.0
+
+        demo_texts = [
+            ("张总", "好的，我们继续讨论下一个议题。"),
+            ("李明", "我这边数据已经准备好了，可以先汇报一下。"),
+            ("王芳", "关于这个方案我有个建议。"),
+            ("赵伟", "收到，我会跟进这个事情。"),
+            ("张总", "这个方向没问题，大家还有什么补充的吗？"),
+        ]
+
+        seg_count = max(1, int(estimated_duration / 3.0))
+        segments = []
+        offset = 0.0
+        for i in range(min(seg_count, len(demo_texts))):
+            speaker, text = demo_texts[i % len(demo_texts)]
+            seg_duration = estimated_duration / seg_count
+            segments.append(
+                TranscriptSegment(
+                    speaker=speaker,
+                    text=text,
+                    start=round(offset, 2),
+                    end=round(offset + seg_duration, 2),
+                    confidence=0.92,
+                )
+            )
+            offset += seg_duration
+
+        full_text = "\n".join(
+            f"[{s.speaker}] {s.text}" for s in segments
+        )
+        return TranscriptResult(
+            meeting_id="chunk-demo",
+            segments=segments,
+            language=language,
+            duration_seconds=estimated_duration,
+            full_text=full_text,
+        )
+
     @staticmethod
     def _generate_demo_transcript(meeting_id: str) -> TranscriptResult:
         """生成演示转写结果（无音频时使用）"""
