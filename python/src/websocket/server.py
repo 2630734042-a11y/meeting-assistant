@@ -27,7 +27,7 @@ load_dotenv()
 from ..graph.meeting_graph import run_meeting_pipeline, resume_meeting_pipeline, compile_meeting_graph
 from ..models.schemas import MeetingStatus, Priority
 from ..realtime.session_manager import LiveSessionManager
-from ..db import get_db, get_cache, create_db_and_tables, async_session_factory
+from ..db import get_db, get_cache, create_db_and_tables, new_db_session
 from ..db.repository import MeetingRepository
 
 from ..utils.media_utils import (
@@ -72,7 +72,7 @@ async def _save_meeting_to_db(
 ) -> None:
     """将 Pipeline 结果写入 PostgreSQL。"""
     try:
-        async with async_session_factory() as db:
+        async with new_db_session() as db:
             repo = MeetingRepository(db)
             await repo.create_meeting(
                 meeting_id,
@@ -267,7 +267,7 @@ async def websocket_live_meeting(websocket: WebSocket, meeting_id: str):
 async def _save_live_session_to_db(meeting_id: str, session: LiveSessionManager) -> None:
     """将实时会议结果写入 PostgreSQL。"""
     try:
-        async with async_session_factory() as db:
+        async with new_db_session() as db:
             repo = MeetingRepository(db)
             await repo.create_meeting(
                 meeting_id,
@@ -529,7 +529,7 @@ async def review_actions(meeting_id: str, request: Request):
 
     # 同步更新数据库中的待办审核状态
     try:
-        async with async_session_factory() as db:
+        async with new_db_session() as db:
             repo = MeetingRepository(db)
             for review in reviewed_items:
                 item_id = review.get("id")
@@ -624,7 +624,7 @@ async def get_transcript(meeting_id: str):
     """获取转写结果"""
     # 优先查 DB
     try:
-        async with async_session_factory() as db:
+        async with new_db_session() as db:
             repo = MeetingRepository(db)
             rows = await repo.get_transcript(meeting_id)
             if rows:
@@ -657,7 +657,7 @@ async def get_transcript(meeting_id: str):
 async def get_summary(meeting_id: str):
     """获取会议纪要"""
     try:
-        async with async_session_factory() as db:
+        async with new_db_session() as db:
             repo = MeetingRepository(db)
             row = await repo.get_summary(meeting_id)
             if row:
@@ -683,7 +683,7 @@ async def get_summary(meeting_id: str):
 async def get_actions(meeting_id: str):
     """获取待办事项"""
     try:
-        async with async_session_factory() as db:
+        async with new_db_session() as db:
             repo = MeetingRepository(db)
             rows = await repo.get_action_items(meeting_id)
             if rows:
@@ -731,7 +731,7 @@ async def get_full_report(meeting_id: str):
     """获取完整报告"""
     # 优先从 DB 组装
     try:
-        async with async_session_factory() as db:
+        async with new_db_session() as db:
             repo = MeetingRepository(db)
             meeting = await repo.get_meeting(meeting_id)
             if meeting:
