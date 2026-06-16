@@ -16,15 +16,19 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
 load_dotenv()
 
 from ..graph.meeting_graph import run_meeting_pipeline, resume_meeting_pipeline, compile_meeting_graph
 from ..models.schemas import MeetingStatus, Priority
 from ..realtime.session_manager import LiveSessionManager
+from ..db import get_db, get_cache, create_db_and_tables, async_session_factory
+from ..db.repository import MeetingRepository
 
 from ..utils.media_utils import (
     SUPPORTED_VIDEO_EXTENSIONS,
@@ -48,9 +52,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def startup():
+    await create_db_and_tables()
+    logger.info("Database tables created/verified")
+
+
 # 存储活跃的 WebSocket 连接和会议状态
 active_connections: dict[str, WebSocket] = {}
-meeting_results: dict[str, dict] = {}
+meeting_results: dict[str, dict] = {}  # 保留用于 LangGraph checkpoint 状态
+
+
+async def _save_meeting_to_db(
+    meeting_id: str,
+    result: dict,
+    title: str | None = None,
+    source: str = "upload",
+) -> None:
+    """将 Pipeline 结果写入 PostgreSQL。"""
+    try:
+        async with async_session_factory() as db:
+            repo = MeetingRepository(db)
+            await repo.create_meeting(
+                meeting_id,
+                title=title or f"会议 {meeting_id}",
+                source=source,
+                status="completed",
+            )
+
+            transcript = result.get("transcript")
+            if transcript:
+                segs = (
+                    transcript.model_dump().get("segments", [])
+                    if hasattr(transcript, "model_dump")
+                    else transcript.get("segments", [])
+                )
+                if segs:
+                    await repo.save_transcript(meeting_id, segs)
+
+            summary = result.get("summary")
+            if summary:
+                sd = summary.model_dump() if hasattr(summary, "model_dump") else summary
+                if sd:
+                    await repo.save_summary(meeting_id, sd)
+
+            actions = result.get("actions")
+            if actions:
+                ad = actions.model_dump() if hasattr(actions, "model_dump") else actions
+                items = ad.get("action_items", []) if isinstance(ad, dict) else []
+                if items:
+                    await repo.save_action_items(meeting_id, items)
+
+            duration = result.get(
+                "duration_seconds",
+                transcript.model_dump().get("duration_seconds", 0)
+                if transcript and hasattr(transcript, "model_dump")
+                else 0,
+            )
+            await repo.update_meeting(
+                meeting_id,
+                duration_seconds=duration,
+                segment_count=len(
+                    transcript.model_dump().get("segments", [])
+                    if transcript and hasattr(transcript, "model_dump")
+                    else []
+                ),
+            )
+    except Exception as e:
+        logger.error(f"Failed to save meeting {meeting_id} to DB: {e}")
 
 
 # ============================================================
@@ -109,6 +179,7 @@ async def websocket_meeting(websocket: WebSocket, meeting_id: str):
                         audio_data=bytes(audio_buffer),
                     )
                     meeting_results[meeting_id] = result
+                    await _save_meeting_to_db(meeting_id, result, source="upload")
 
                     await _send_results(websocket, result)
                     audio_buffer.clear()
@@ -123,6 +194,8 @@ async def websocket_meeting(websocket: WebSocket, meeting_id: str):
                         audio_data=b"",
                     )
                     meeting_results[meeting_id] = result
+                    await _save_meeting_to_db(meeting_id, result, source="upload")
+
                     await _send_results(websocket, result)
 
                 elif msg_type == "ping":
@@ -178,6 +251,8 @@ async def websocket_live_meeting(websocket: WebSocket, meeting_id: str):
 
     try:
         await session.run()
+        # 会议结束后写入 DB
+        await _save_live_session_to_db(meeting_id, session)
     except Exception as e:
         logger.error(f"Live session error: {meeting_id} - {e}")
         try:
@@ -187,6 +262,30 @@ async def websocket_live_meeting(websocket: WebSocket, meeting_id: str):
             })
         except Exception:
             pass
+
+
+async def _save_live_session_to_db(meeting_id: str, session: LiveSessionManager) -> None:
+    """将实时会议结果写入 PostgreSQL。"""
+    try:
+        async with async_session_factory() as db:
+            repo = MeetingRepository(db)
+            await repo.create_meeting(
+                meeting_id,
+                title=f"实时会议 {meeting_id}",
+                source="live",
+                status="completed",
+            )
+            if session.final_transcript:
+                segs = session.final_transcript.model_dump().get("segments", [])
+                if segs:
+                    await repo.save_transcript(meeting_id, segs)
+                    await repo.update_meeting(
+                        meeting_id,
+                        duration_seconds=session.final_transcript.duration_seconds,
+                        segment_count=len(segs),
+                    )
+    except Exception as e:
+        logger.error(f"Failed to save live session {meeting_id} to DB: {e}")
 
 
 async def _send_results(websocket: WebSocket, state: dict):
@@ -267,7 +366,12 @@ async def start_meeting():
 
 
 @app.post("/api/v1/meeting/{meeting_id}/upload")
-async def upload_audio(meeting_id: str, file: UploadFile = File(...)):
+async def upload_audio(
+    meeting_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    cache: Redis = Depends(get_cache),
+):
     """上传音频文件并处理"""
     audio_data = await file.read()
     logger.info(
@@ -282,6 +386,9 @@ async def upload_audio(meeting_id: str, file: UploadFile = File(...)):
     )
     meeting_results[meeting_id] = result
 
+    # 写入数据库
+    await _save_meeting_to_db(meeting_id, result, title=file.filename, source="upload")
+
     return {
         "meeting_id": meeting_id,
         "thread_id": thread_id,
@@ -291,7 +398,12 @@ async def upload_audio(meeting_id: str, file: UploadFile = File(...)):
 
 
 @app.post("/api/v1/meeting/{meeting_id}/upload-video")
-async def upload_video(meeting_id: str, file: UploadFile = File(...)):
+async def upload_video(
+    meeting_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    cache: Redis = Depends(get_cache),
+):
     """
     上传视频文件并处理
 
@@ -357,6 +469,9 @@ async def upload_video(meeting_id: str, file: UploadFile = File(...)):
     )
     meeting_results[meeting_id] = result
 
+    # 写入数据库
+    await _save_meeting_to_db(meeting_id, result, title=file.filename, source="upload")
+
     return {
         "meeting_id": meeting_id,
         "thread_id": thread_id,
@@ -412,6 +527,20 @@ async def review_actions(meeting_id: str, request: Request):
         f"Review submitted for {meeting_id}: {updated_count} items"
     )
 
+    # 同步更新数据库中的待办审核状态
+    try:
+        async with async_session_factory() as db:
+            repo = MeetingRepository(db)
+            for review in reviewed_items:
+                item_id = review.get("id")
+                if item_id is not None:
+                    await repo.update_action_review(
+                        item_id,
+                        review.get("review_status", "reviewed"),
+                    )
+    except Exception as e:
+        logger.warning(f"Failed to sync review to DB (non-fatal): {e}")
+
     # 将更新后的 actions 写回 LangGraph checkpoint，确保 resume 读到审核结果
     thread_id = body.get("thread_id", f"thread-{meeting_id}")
     try:
@@ -433,7 +562,11 @@ async def review_actions(meeting_id: str, request: Request):
 
 
 @app.post("/api/v1/meeting/{meeting_id}/demo")
-async def run_demo(meeting_id: str = "demo"):
+async def run_demo(
+    meeting_id: str = "demo",
+    db: AsyncSession = Depends(get_db),
+    cache: Redis = Depends(get_cache),
+):
     """运行演示模式（无需音频）"""
     thread_id = f"thread-{meeting_id}"
     result = await run_meeting_pipeline(
@@ -442,6 +575,7 @@ async def run_demo(meeting_id: str = "demo"):
         thread_id=thread_id,
     )
     meeting_results[meeting_id] = result
+    await _save_meeting_to_db(meeting_id, result, title=f"Demo {meeting_id}", source="upload")
 
     response: dict[str, Any] = {
         "meeting_id": meeting_id,
@@ -471,6 +605,10 @@ async def resume_pipeline(meeting_id: str, request: Request):
     try:
         final_state = await resume_meeting_pipeline(thread_id=thread_id)
         meeting_results[meeting_id] = final_state
+
+        # 写回数据库（更新 actions 审核状态）
+        await _save_meeting_to_db(meeting_id, final_state, source="upload")
+
         return {
             "meeting_id": meeting_id,
             "status": final_state.get("status", "syncing"),
@@ -484,6 +622,28 @@ async def resume_pipeline(meeting_id: str, request: Request):
 @app.get("/api/v1/meeting/{meeting_id}/transcript")
 async def get_transcript(meeting_id: str):
     """获取转写结果"""
+    # 优先查 DB
+    try:
+        async with async_session_factory() as db:
+            repo = MeetingRepository(db)
+            rows = await repo.get_transcript(meeting_id)
+            if rows:
+                return {
+                    "segments": [
+                        {
+                            "speaker": r.speaker,
+                            "text": r.text,
+                            "start": r.start,
+                            "end": r.end,
+                            "confidence": r.confidence,
+                        }
+                        for r in rows
+                    ]
+                }
+    except Exception:
+        pass
+
+    # fallback 到内存
     result = meeting_results.get(meeting_id)
     if not result:
         return {"error": "Meeting not found"}
@@ -496,6 +656,20 @@ async def get_transcript(meeting_id: str):
 @app.get("/api/v1/meeting/{meeting_id}/summary")
 async def get_summary(meeting_id: str):
     """获取会议纪要"""
+    try:
+        async with async_session_factory() as db:
+            repo = MeetingRepository(db)
+            row = await repo.get_summary(meeting_id)
+            if row:
+                return {
+                    "title": row.title,
+                    "topics": json.loads(row.topics) if row.topics else [],
+                    "decisions": row.decisions,
+                    "conclusions": row.conclusions,
+                }
+    except Exception:
+        pass
+
     result = meeting_results.get(meeting_id)
     if not result:
         return {"error": "Meeting not found"}
@@ -508,6 +682,29 @@ async def get_summary(meeting_id: str):
 @app.get("/api/v1/meeting/{meeting_id}/actions")
 async def get_actions(meeting_id: str):
     """获取待办事项"""
+    try:
+        async with async_session_factory() as db:
+            repo = MeetingRepository(db)
+            rows = await repo.get_action_items(meeting_id)
+            if rows:
+                return {
+                    "action_items": [
+                        {
+                            "id": r.id,
+                            "task": r.task,
+                            "owner": r.owner,
+                            "priority": r.priority,
+                            "due_date": r.due_date,
+                            "review_status": r.review_status,
+                            "jira_key": r.jira_key,
+                            "feishu_task_id": r.feishu_task_id,
+                        }
+                        for r in rows
+                    ]
+                }
+    except Exception:
+        pass
+
     result = meeting_results.get(meeting_id)
     if not result:
         return {"error": "Meeting not found"}
@@ -532,6 +729,42 @@ async def get_insights(meeting_id: str):
 @app.get("/api/v1/meeting/{meeting_id}/report")
 async def get_full_report(meeting_id: str):
     """获取完整报告"""
+    # 优先从 DB 组装
+    try:
+        async with async_session_factory() as db:
+            repo = MeetingRepository(db)
+            meeting = await repo.get_meeting(meeting_id)
+            if meeting:
+                transcript_rows = await repo.get_transcript(meeting_id)
+                summary_row = await repo.get_summary(meeting_id)
+                action_rows = await repo.get_action_items(meeting_id)
+
+                response: dict[str, Any] = {"meeting_id": meeting_id}
+                if transcript_rows:
+                    response["transcript"] = {
+                        "segments": [
+                            {"speaker": r.speaker, "text": r.text, "start": r.start, "end": r.end, "confidence": r.confidence}
+                            for r in transcript_rows
+                        ]
+                    }
+                if summary_row:
+                    response["summary"] = {
+                        "title": summary_row.title,
+                        "topics": json.loads(summary_row.topics) if summary_row.topics else [],
+                        "decisions": summary_row.decisions,
+                        "conclusions": summary_row.conclusions,
+                    }
+                if action_rows:
+                    response["actions"] = {
+                        "action_items": [r.model_dump() for r in action_rows]
+                    }
+                if response:
+                    response["status"] = meeting.status
+                    return response
+    except Exception:
+        pass
+
+    # fallback 到内存
     result = meeting_results.get(meeting_id)
     if not result:
         return {"error": "Meeting not found"}
@@ -544,6 +777,90 @@ async def get_full_report(meeting_id: str):
 
     response["errors"] = result.get("errors", [])
     return response
+
+
+# ============================================================
+# 新增: 历史记录 API（DB 持久化）
+# ============================================================
+
+@app.get("/api/v1/meetings")
+async def list_meetings(
+    page: int = 1,
+    size: int = 20,
+    db: AsyncSession = Depends(get_db),
+    cache: Redis = Depends(get_cache),
+):
+    """历史会议列表（分页）。"""
+    repo = MeetingRepository(db, cache)
+    meetings, total = await repo.list_meetings(page, size)
+    return {
+        "items": [
+            {
+                "id": m.id,
+                "title": m.title,
+                "status": m.status,
+                "source": m.source,
+                "duration_seconds": m.duration_seconds,
+                "segment_count": m.segment_count,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in meetings
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
+
+
+@app.get("/api/v1/meeting/{meeting_id}")
+async def get_meeting_detail(
+    meeting_id: str,
+    db: AsyncSession = Depends(get_db),
+    cache: Redis = Depends(get_cache),
+):
+    """获取会议完整详情。"""
+    repo = MeetingRepository(db, cache)
+    meeting = await repo.get_meeting(meeting_id)
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    transcript = await repo.get_transcript(meeting_id)
+    summary = await repo.get_summary(meeting_id)
+    actions = await repo.get_action_items(meeting_id)
+
+    return {
+        "id": meeting.id,
+        "title": meeting.title,
+        "status": meeting.status,
+        "source": meeting.source,
+        "duration_seconds": meeting.duration_seconds,
+        "segment_count": meeting.segment_count,
+        "created_at": meeting.created_at.isoformat() if meeting.created_at else None,
+        "transcript": {
+            "segments": [
+                {"speaker": s.speaker, "text": s.text, "start": s.start, "end": s.end, "confidence": s.confidence}
+                for s in transcript
+            ]
+        } if transcript else None,
+        "summary": summary.model_dump() if summary else None,
+        "actions": {
+            "action_items": [a.model_dump() for a in actions]
+        } if actions else None,
+    }
+
+
+@app.delete("/api/v1/meeting/{meeting_id}")
+async def delete_meeting(
+    meeting_id: str,
+    db: AsyncSession = Depends(get_db),
+    cache: Redis = Depends(get_cache),
+):
+    """删除会议及所有关联数据。"""
+    repo = MeetingRepository(db, cache)
+    deleted = await repo.delete_meeting(meeting_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    return {"status": "deleted", "meeting_id": meeting_id}
 
 
 # ============================================================

@@ -45,4 +45,19 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ thread_id: threadId }),
     }),
+
+  // ========== 历史记录 ==========
+
+  listMeetings: (page = 1, size = 20) =>
+    request<{ items: any[]; total: number; page: number; size: number }>(
+      `/api/v1/meetings?page=${page}&size=${size}`
+    ),
+
+  getMeeting: (meetingId: string) =>
+    request<any>(`/api/v1/meeting/${meetingId}`),
+
+  deleteMeeting: (meetingId: string) =>
+    request<{ status: string }>(`/api/v1/meeting/${meetingId}`, {
+      method: 'DELETE',
+    }),
 }
